@@ -268,22 +268,36 @@ class VoiceTranscriber:
                 temp_audio.write(voice_file_bytes)
                 temp_audio_path = temp_audio.name
             
-            # Transcribe using Whisper
-            with open(temp_audio_path, "rb") as audio_file:
-                transcript = self.client.audio.transcriptions.create(
-                    model="whisper-1",
-                    file=audio_file,
-                    response_format="text"
-                )
+            # Transcribe using Whisper (run sync operation in executor to not block)
+            loop = asyncio.get_event_loop()
+            transcript = await loop.run_in_executor(
+                None,
+                self._transcribe_sync,
+                temp_audio_path
+            )
             
             # Clean up temp file
-            os.unlink(temp_audio_path)
+            try:
+                os.unlink(temp_audio_path)
+            except:
+                pass  # Ignore cleanup errors
             
             return transcript.strip() if transcript else None
             
         except Exception as e:
             logger.error(f"Whisper transcription error: {e}")
+            logger.error(f"Error details: {str(e)}")
             return None
+    
+    def _transcribe_sync(self, audio_path: str) -> str:
+        """Synchronous transcription helper"""
+        with open(audio_path, "rb") as audio_file:
+            transcript = self.client.audio.transcriptions.create(
+                model="whisper-1",
+                file=audio_file,
+                response_format="text"
+            )
+        return transcript
 
 
 class ClaudeAssistant:
@@ -291,98 +305,85 @@ class ClaudeAssistant:
     
     def __init__(self, api_key: str):
         self.client = anthropic.Anthropic(api_key=api_key)
-        self.model = "claude-haiku-4-5-20251001"  # Cheapest model
+        self.model = "claude-sonnet-4-5-20250929"  # Better quality for conversations!
     
     async def analyze_message(self, message: str, context: Optional[str] = None) -> Dict:
-        """
-        Analyze user message to extract:
-        - Diary entries
-        - Tasks/reminders
-        - Creative ideas
-        - Questions requiring response
-        
-        Uses minimal tokens by being specific in prompt
-        """
-        system_prompt = """You are a proactive personal assistant combining: life coach, project manager, therapist, and business advisor.
+        """Simple conversational response without JSON complexity"""
+        system_prompt = """You are a warm personal assistant - life coach, therapist, Buddhist teacher, and friend.
 
-ALWAYS provide helpful responses. Be encouraging, insightful, and actionable.
+Respond naturally and helpfully to what they share. Include:
+- Empathy and understanding
+- Practical advice when relevant  
+- Buddhist wisdom when appropriate
+- Encouragement and support
+- Follow-up questions
 
-Analyze the user's message and extract:
-1. Main diary content (what they did/plan to do)
-2. Any reminders/tasks with dates (extract date if mentioned)
-3. Creative ideas or goals
-4. Whether they would benefit from coaching/advice
-5. Whether they need web search for current information
-
-NEEDS WEB SEARCH if asking about:
-- Flight prices, hotel rates, current prices
-- Current events, news, weather
-- Recent information (sports scores, stock prices)
-- Factual lookups (business hours, contact info)
-- Research requiring current data
-
-WANTS MORNING NEWS if they say:
-- "Send me news every morning"
-- "I want daily news"
-- "Can you give me morning updates?"
-Set wants_morning_news to true and extract the time if mentioned.
-
-BE GENEROUS with needs_response - set to true for:
-- Any questions (obvious or implicit)
-- Goals or ideas shared (offer guidance)
-- Challenges or problems mentioned (provide support)
-- Accomplishments (celebrate and encourage)
-- Plans mentioned (help structure them)
-- ANY situation where coaching would help
-
-ONLY set needs_response to false for:
-- Very simple status updates with no actionable element
-- Pure factual statements with no room for improvement
-
-Respond in JSON format only:
-{
-  "diary_entry": "summary of what happened/plans",
-  "category": "work|personal|creative|health|other",
-  "reminders": [{"content": "task", "date": "YYYY-MM-DD or 'today'/'tomorrow'/'tuesday' etc", "priority": "high|normal"}],
-  "ideas": ["idea1", "idea2"],
-  "needs_response": true,
-  "needs_search": false,
-  "search_query": "what to search for if needs_search is true",
-  "wants_morning_news": false,
-  "news_time": "08:00",
-  "question": "coaching opportunity: what they're working on, what they need help with, or what deserves encouragement"
-}"""
+Be conversational and warm - 150-400 words."""
         
         user_message = message
         if context:
-            user_message = f"Recent context: {context}\n\nNew message: {message}"
+            user_message = f"Recent: {context}\n\nNow: {message}"
         
         try:
-            response = self.client.messages.create(
+            # Get simple conversational response
+            resp = self.client.messages.create(
                 model=self.model,
-                max_tokens=600,  # Increased for better responses
+                max_tokens=1000,
                 system=system_prompt,
                 messages=[{"role": "user", "content": user_message}]
             )
             
-            # Parse JSON response
-            content = response.content[0].text
-            return json.loads(content)
-        except Exception as e:
-            logger.error(f"Claude API error: {e}")
+            ai_response = resp.content[0].text.strip()
+            
+            # Simple keyword extraction
+            msg_lower = message.lower()
+            reminders = []
+            ideas = []
+            
+            # Check for reminders
+            days = ["tomorrow", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+            if any(day in msg_lower for day in days) and any(word in msg_lower for word in ["remind", "need to", "have to", "must", "should"]):
+                date = next((day for day in days if day in msg_lower), "tomorrow")
+                reminders.append({"content": message[:100], "date": date, "priority": "normal"})
+            
+            # Check for ideas
+            if any(word in msg_lower for word in ["want to", "thinking about", "idea", "plan to", "should i"]):
+                ideas.append(message[:100])
+            
+            # Check for news request
+            wants_news = any(phrase in msg_lower for phrase in ["morning news", "daily news", "news every"])
+            
+            # Simple categorization
+            if any(w in msg_lower for w in ["work", "job", "career", "meeting"]):
+                category = "work"
+            elif any(w in msg_lower for w in ["health", "exercise", "tired", "sick"]):
+                category = "health"
+            elif any(w in msg_lower for w in ["create", "art", "write", "design"]):
+                category = "creative"
+            else:
+                category = "personal"
+            
             return {
+                "response": ai_response,
+                "diary_entry": message[:200],
+                "category": category,
+                "reminders": reminders,
+                "ideas": ideas,
+                "wants_morning_news": wants_news,
+                "news_time": "08:00"
+            }
+        except Exception as e:
+            logger.error(f"API error: {e}")
+            return {
+                "response": "I'm here! Tell me what's on your mind and I'll help however I can. 💭",
                 "diary_entry": message,
                 "category": "general",
                 "reminders": [],
                 "ideas": [],
-                "needs_response": False,
-                "needs_search": False,
-                "search_query": "",
                 "wants_morning_news": False,
-                "news_time": "08:00",
-                "question": None
+                "news_time": "08:00"
             }
-    
+
     async def provide_advice(self, question: str, ideas: List[str], context: str) -> str:
         """Provide coaching, advice and action plans with Buddhist wisdom and art therapy"""
         system_prompt = """You are an AI combining deep expertise as:
@@ -602,52 +603,36 @@ class DiaryBot:
                 self.db.add_reminder(user_id, reminder_date, reminder["content"])
                 reminder_count += 1
         
-        # Build response
+        # Get the AI's conversational response (it's already in the analysis!)
+        ai_response = analysis.get("response", "")
+        
+        # Build response parts
         response_parts = []
         
-        # Handle web search if needed
-        if analysis.get("needs_search") and analysis.get("search_query"):
-            await update.message.chat.send_action("typing")
-            search_result = await self.claude.search_and_answer(
-                analysis["search_query"],
-                context_text or ""
-            )
-            response_parts.append(f"🔍 {search_result}")
-        
-        # Add confirmation with context (only if not a pure search query)
-        if not analysis.get("needs_search"):
-            if reminder_count > 0 and analysis["ideas"]:
-                response_parts.append("✅ Got it! Reminders set and ideas captured.")
-            elif reminder_count > 0:
-                response_parts.append("✅ Saved! I'll remind you about that.")
-            elif analysis["ideas"]:
-                response_parts.append("✅ Noted! Interesting ideas here.")
-            else:
-                response_parts.append("✅ Logged!")
-        
+        # Add metadata tags if relevant
+        metadata = []
         if reminder_count > 0:
-            response_parts.append(f"⏰ {reminder_count} reminder(s) scheduled")
+            metadata.append(f"⏰ {reminder_count} reminder(s) set")
+        if analysis.get("ideas"):
+            metadata.append(f"💡 {len(analysis['ideas'])} idea(s) captured")
         
-        if analysis["ideas"]:
-            response_parts.append(f"💡 {len(analysis['ideas'])} idea(s) captured")
+        if metadata:
+            response_parts.append(" | ".join(metadata))
+        
+        # Add the main conversational response (THIS IS THE KEY!)
+        if ai_response:
+            response_parts.append(f"\n{ai_response}")
+        else:
+            # Fallback if somehow response is empty
+            response_parts.append("\nI'm here and listening! Tell me more. 💭")
         
         # Handle morning news request
         if analysis.get("wants_morning_news"):
             news_time = analysis.get("news_time", "08:00")
             self.db.set_morning_news(user_id, True, news_time)
             response_parts.append(
-                f"\n📰 Perfect! I'll send you morning news every day at {news_time}.\n"
-                f"You can change this anytime with /news command."
+                f"\n📰 I'll send you morning news every day at {news_time}!"
             )
-        
-        # ALWAYS provide coaching/advice when possible (but not for pure search queries or news setup)
-        if analysis["needs_response"] and analysis["question"] and not analysis.get("needs_search") and not analysis.get("wants_morning_news"):
-            advice = await self.claude.provide_advice(
-                analysis["question"],
-                analysis["ideas"],
-                context_text or ""
-            )
-            response_parts.append(f"\n{advice}")
         
         await update.message.reply_text("\n".join(response_parts))
     
@@ -733,7 +718,17 @@ class DiaryBot:
             
         except Exception as e:
             logger.error(f"Voice handling error: {e}")
-            await update.message.reply_text("❌ Sorry, something went wrong processing your voice message. Please try again!")
+            error_msg = str(e)
+            if "openai" in error_msg.lower() or "whisper" in error_msg.lower():
+                await update.message.reply_text(
+                    "❌ Voice transcription isn't set up yet. "
+                    "Please send text messages for now, or ask me to help set up OpenAI!"
+                )
+            else:
+                await update.message.reply_text(
+                    f"❌ Sorry, something went wrong: {error_msg[:100]}\n"
+                    "Try sending a text message instead!"
+                )
     
     async def show_reminders(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Show pending reminders"""
