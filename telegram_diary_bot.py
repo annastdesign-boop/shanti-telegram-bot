@@ -24,7 +24,6 @@ from telegram.ext import (
 import anthropic
 from openai import OpenAI
 import tempfile
-import requests
 
 # Configure logging
 logging.basicConfig(
@@ -292,67 +291,61 @@ class ClaudeAssistant:
     
     def __init__(self, api_key: str):
         self.client = anthropic.Anthropic(api_key=api_key)
-        self.model = "claude-haiku-4-5-20251001"  # Cheapest model
+        self.model = "claude-sonnet-4-5-20250929"  # Better quality for conversations!
     
     async def analyze_message(self, message: str, context: Optional[str] = None) -> Dict:
         """
-        Analyze user message to extract:
-        - Diary entries
-        - Tasks/reminders
-        - Creative ideas
-        - Questions requiring response
-        
-        Uses minimal tokens by being specific in prompt
+        Analyze message AND provide response in one go - like a real conversation!
         """
-        system_prompt = """You are a proactive personal assistant combining: life coach, project manager, therapist, and business advisor.
+        system_prompt = """You are a warm, engaging personal assistant combining: life coach, therapist, project manager, business advisor, Buddhist teacher, and art therapist.
 
-ALWAYS provide helpful responses. Be encouraging, insightful, and actionable.
+RESPOND LIKE A HELPFUL FRIEND - conversational, warm, insightful, and actionable.
 
-Analyze the user's message and extract:
-1. Main diary content (what they did/plan to do)
-2. Any reminders/tasks with dates (extract date if mentioned)
-3. Creative ideas or goals
-4. Whether they would benefit from coaching/advice
-5. Whether they need web search for current information
+Your response should:
+1. Acknowledge what they shared with empathy
+2. Provide helpful guidance, encouragement, or advice
+3. Be natural and conversational (not robotic)
+4. Include Buddhist wisdom or art therapy when relevant
+5. Ask thoughtful follow-up questions
+6. Be encouraging and supportive
 
-NEEDS WEB SEARCH if asking about:
-- Flight prices, hotel rates, current prices
-- Current events, news, weather
-- Recent information (sports scores, stock prices)
-- Factual lookups (business hours, contact info)
-- Research requiring current data
+Length: 150-400 words depending on complexity
 
-WANTS MORNING NEWS if they say:
-- "Send me news every morning"
-- "I want daily news"
-- "Can you give me morning updates?"
-Set wants_morning_news to true and extract the time if mentioned.
+Also extract structured data for the diary system.
 
-BE GENEROUS with needs_response - set to true for:
-- Any questions (obvious or implicit)
-- Goals or ideas shared (offer guidance)
-- Challenges or problems mentioned (provide support)
-- Accomplishments (celebrate and encourage)
-- Plans mentioned (help structure them)
-- ANY situation where coaching would help
-
-ONLY set needs_response to false for:
-- Very simple status updates with no actionable element
-- Pure factual statements with no room for improvement
-
-Respond in JSON format only:
+Respond in JSON format:
 {
-  "diary_entry": "summary of what happened/plans",
+  "response": "Your warm, helpful, conversational response to them - THIS IS MOST IMPORTANT",
+  "diary_entry": "brief summary for diary",
   "category": "work|personal|creative|health|other",
-  "reminders": [{"content": "task", "date": "YYYY-MM-DD or 'today'/'tomorrow'/'tuesday' etc", "priority": "high|normal"}],
+  "reminders": [{"content": "task", "date": "YYYY-MM-DD or 'today'/'tomorrow'", "priority": "high|normal"}],
   "ideas": ["idea1", "idea2"],
-  "needs_response": true,
-  "needs_search": false,
-  "search_query": "what to search for if needs_search is true",
   "wants_morning_news": false,
-  "news_time": "08:00",
-  "question": "coaching opportunity: what they're working on, what they need help with, or what deserves encouragement"
-}"""
+  "news_time": "08:00"
+}
+
+CRITICAL: The "response" field should ALWAYS have a helpful, encouraging reply. Never leave it empty!
+
+Examples:
+User: "I'm thinking about changing careers"
+Response: "That's a big decision! Career changes can feel both exciting and scary. What's driving this desire to change? Is it the work itself, the environment, or something else? 
+
+Let me share something from Buddhist wisdom: Lama Zopa Rinpoche teaches that change is impermanence in action - resisting it creates suffering. But that doesn't mean rushing in blindly!
+
+Practical steps:
+1. Clarify what you want (not just what you're leaving)
+2. Identify transferable skills
+3. Maybe explore through a side project first?
+
+What field are you drawn to? 💫"
+
+User: "Finished my presentation today"
+Response: "Awesome! 🎉 Completing that presentation is a real win. How did it feel to get it done? 
+
+This is great momentum - what's the next milestone you want to hit while you're on a roll? Sometimes finishing one thing energizes us for the next.
+
+From a dharma perspective, celebrating accomplishments without attachment is a practice - enjoy the satisfaction while staying present. Well done! ✨"
+"""
         
         user_message = message
         if context:
@@ -361,7 +354,7 @@ Respond in JSON format only:
         try:
             response = self.client.messages.create(
                 model=self.model,
-                max_tokens=600,  # Increased for better responses
+                max_tokens=1000,  # Much higher for real conversations!
                 system=system_prompt,
                 messages=[{"role": "user", "content": user_message}]
             )
@@ -372,16 +365,13 @@ Respond in JSON format only:
         except Exception as e:
             logger.error(f"Claude API error: {e}")
             return {
+                "response": "I'm here and listening! Tell me more about what's on your mind. 💭",
                 "diary_entry": message,
                 "category": "general",
                 "reminders": [],
                 "ideas": [],
-                "needs_response": False,
-                "needs_search": False,
-                "search_query": "",
                 "wants_morning_news": False,
-                "news_time": "08:00",
-                "question": None
+                "news_time": "08:00"
             }
     
     async def provide_advice(self, question: str, ideas: List[str], context: str) -> str:
@@ -603,52 +593,36 @@ class DiaryBot:
                 self.db.add_reminder(user_id, reminder_date, reminder["content"])
                 reminder_count += 1
         
-        # Build response
+        # Get the AI's conversational response (it's already in the analysis!)
+        ai_response = analysis.get("response", "")
+        
+        # Build response parts
         response_parts = []
         
-        # Handle web search if needed
-        if analysis.get("needs_search") and analysis.get("search_query"):
-            await update.message.chat.send_action("typing")
-            search_result = await self.claude.search_and_answer(
-                analysis["search_query"],
-                context_text or ""
-            )
-            response_parts.append(f"🔍 {search_result}")
-        
-        # Add confirmation with context (only if not a pure search query)
-        if not analysis.get("needs_search"):
-            if reminder_count > 0 and analysis["ideas"]:
-                response_parts.append("✅ Got it! Reminders set and ideas captured.")
-            elif reminder_count > 0:
-                response_parts.append("✅ Saved! I'll remind you about that.")
-            elif analysis["ideas"]:
-                response_parts.append("✅ Noted! Interesting ideas here.")
-            else:
-                response_parts.append("✅ Logged!")
-        
+        # Add metadata tags if relevant
+        metadata = []
         if reminder_count > 0:
-            response_parts.append(f"⏰ {reminder_count} reminder(s) scheduled")
+            metadata.append(f"⏰ {reminder_count} reminder(s) set")
+        if analysis.get("ideas"):
+            metadata.append(f"💡 {len(analysis['ideas'])} idea(s) captured")
         
-        if analysis["ideas"]:
-            response_parts.append(f"💡 {len(analysis['ideas'])} idea(s) captured")
+        if metadata:
+            response_parts.append(" | ".join(metadata))
+        
+        # Add the main conversational response (THIS IS THE KEY!)
+        if ai_response:
+            response_parts.append(f"\n{ai_response}")
+        else:
+            # Fallback if somehow response is empty
+            response_parts.append("\nI'm here and listening! Tell me more. 💭")
         
         # Handle morning news request
         if analysis.get("wants_morning_news"):
             news_time = analysis.get("news_time", "08:00")
             self.db.set_morning_news(user_id, True, news_time)
             response_parts.append(
-                f"\n📰 Perfect! I'll send you morning news every day at {news_time}.\n"
-                f"You can change this anytime with /news command."
+                f"\n📰 I'll send you morning news every day at {news_time}!"
             )
-        
-        # ALWAYS provide coaching/advice when possible (but not for pure search queries or news setup)
-        if analysis["needs_response"] and analysis["question"] and not analysis.get("needs_search") and not analysis.get("wants_morning_news"):
-            advice = await self.claude.provide_advice(
-                analysis["question"],
-                analysis["ideas"],
-                context_text or ""
-            )
-            response_parts.append(f"\n{advice}")
         
         await update.message.reply_text("\n".join(response_parts))
     
