@@ -313,7 +313,10 @@ Length: 150-400 words depending on complexity
 
 Also extract structured data for the diary system.
 
-Respond in JSON format:
+CRITICAL: Respond with ONLY valid JSON - no markdown, no code blocks, no explanation.
+Start your response with { and end with }
+
+Respond in this EXACT JSON format:
 {
   "response": "Your warm, helpful, conversational response to them - THIS IS MOST IMPORTANT",
   "diary_entry": "brief summary for diary",
@@ -359,9 +362,34 @@ From a dharma perspective, celebrating accomplishments without attachment is a p
                 messages=[{"role": "user", "content": user_message}]
             )
             
-            # Parse JSON response
-            content = response.content[0].text
-            return json.loads(content)
+            # Parse JSON response - strip any markdown formatting
+            content = response.content[0].text.strip()
+            
+            # Remove markdown code blocks if present
+            if content.startswith("```json"):
+                content = content.replace("```json", "").replace("```", "").strip()
+            elif content.startswith("```"):
+                content = content.replace("```", "").strip()
+            
+            # Try to parse JSON
+            try:
+                result = json.loads(content)
+                return result
+            except json.JSONDecodeError as json_err:
+                # Log the actual content that failed to parse
+                logger.error(f"JSON parse error: {json_err}")
+                logger.error(f"Raw content: {content[:500]}")  # Log first 500 chars
+                
+                # Return fallback with actual error info
+                return {
+                    "response": "I'm having trouble processing that right now. Let me try again - what's on your mind?",
+                    "diary_entry": message,
+                    "category": "general",
+                    "reminders": [],
+                    "ideas": [],
+                    "wants_morning_news": False,
+                    "news_time": "08:00"
+                }
         except Exception as e:
             logger.error(f"Claude API error: {e}")
             return {
@@ -708,7 +736,17 @@ class DiaryBot:
             
         except Exception as e:
             logger.error(f"Voice handling error: {e}")
-            await update.message.reply_text("❌ Sorry, something went wrong processing your voice message. Please try again!")
+            error_msg = str(e)
+            if "openai" in error_msg.lower() or "whisper" in error_msg.lower():
+                await update.message.reply_text(
+                    "❌ Voice transcription isn't set up yet. "
+                    "Please send text messages for now, or ask me to help set up OpenAI!"
+                )
+            else:
+                await update.message.reply_text(
+                    f"❌ Sorry, something went wrong: {error_msg[:100]}\n"
+                    "Try sending a text message instead!"
+                )
     
     async def show_reminders(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Show pending reminders"""
