@@ -22,6 +22,8 @@ from telegram.ext import (
     filters,
 )
 import anthropic
+from openai import OpenAI
+import tempfile
 
 # Configure logging
 logging.basicConfig(
@@ -190,6 +192,47 @@ class DiaryDatabase:
         conn.close()
 
 
+class VoiceTranscriber:
+    """OpenAI Whisper API integration for voice-to-text"""
+    
+    def __init__(self, api_key: str):
+        self.client = OpenAI(api_key=api_key)
+    
+    async def transcribe_voice(self, voice_file_bytes: bytes, filename: str = "voice.ogg") -> Optional[str]:
+        """
+        Transcribe voice message to text using Whisper API
+        
+        Args:
+            voice_file_bytes: Audio file bytes from Telegram
+            filename: Original filename (default: voice.ogg)
+        
+        Returns:
+            Transcribed text or None if error
+        """
+        try:
+            # Create a temporary file for the audio
+            with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as temp_audio:
+                temp_audio.write(voice_file_bytes)
+                temp_audio_path = temp_audio.name
+            
+            # Transcribe using Whisper
+            with open(temp_audio_path, "rb") as audio_file:
+                transcript = self.client.audio.transcriptions.create(
+                    model="whisper-1",
+                    file=audio_file,
+                    response_format="text"
+                )
+            
+            # Clean up temp file
+            os.unlink(temp_audio_path)
+            
+            return transcript.strip() if transcript else None
+            
+        except Exception as e:
+            logger.error(f"Whisper transcription error: {e}")
+            return None
+
+
 class ClaudeAssistant:
     """Claude API integration optimized for minimal token usage"""
     
@@ -282,11 +325,12 @@ class DiaryBot:
     """Main Telegram bot class"""
     
     # Add __weakref__ slot to support weak references in Python 3.13
-    __slots__ = ('db', 'claude', 'application', '__weakref__')
+    __slots__ = ('db', 'claude', 'whisper', 'application', '__weakref__')
     
-    def __init__(self, telegram_token: str, anthropic_key: str):
+    def __init__(self, telegram_token: str, anthropic_key: str, openai_key: str):
         self.db = DiaryDatabase()
         self.claude = ClaudeAssistant(anthropic_key)
+        self.whisper = VoiceTranscriber(openai_key)
         self.application = Application.builder().token(telegram_token).build()
         
         # Add handlers
@@ -296,6 +340,7 @@ class DiaryBot:
         self.application.add_handler(CommandHandler("done", self.complete_reminder))
         self.application.add_handler(CommandHandler("summary", self.weekly_summary))
         self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
+        self.application.add_handler(MessageHandler(filters.VOICE, self.handle_voice))  # Voice messages
         
         # Schedule reminder checks
         job_queue = self.application.job_queue
@@ -310,8 +355,9 @@ class DiaryBot:
             "✍️ Keep a diary of your thoughts and plans\n"
             "💡 Organize your creative ideas\n"
             "⏰ Remember important tasks\n"
-            "🎯 Create action plans for your goals\n\n"
-            "Just send me messages about your day, ideas, or tasks!\n\n"
+            "🎯 Create action plans for your goals\n"
+            "🎤 Voice messages supported!\n\n"
+            "Just send me text or voice messages about your day, ideas, or tasks!\n\n"
             "Commands:\n"
             "/reminders - View pending reminders\n"
             "/done <id> - Mark reminder as complete\n"
@@ -384,6 +430,80 @@ class DiaryBot:
             response_parts.append(f"\n\n{advice}")
         
         await update.message.reply_text("\n".join(response_parts))
+    
+    async def handle_voice(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle incoming voice messages"""
+        user_id = update.effective_user.id
+        
+        # Show typing indicator
+        await update.message.chat.send_action("typing")
+        
+        try:
+            # Download voice file
+            voice = update.message.voice
+            voice_file = await voice.get_file()
+            voice_bytes = await voice_file.download_as_bytearray()
+            
+            # Send processing message
+            processing_msg = await update.message.reply_text("🎤 Transcribing your voice message...")
+            
+            # Transcribe with Whisper
+            transcribed_text = await self.whisper.transcribe_voice(bytes(voice_bytes))
+            
+            if not transcribed_text:
+                await processing_msg.edit_text("❌ Sorry, I couldn't transcribe that. Please try again or send a text message.")
+                return
+            
+            # Delete processing message
+            await processing_msg.delete()
+            
+            # Show what was transcribed
+            await update.message.reply_text(f"🎤 You said:\n\n_{transcribed_text}_", parse_mode='Markdown')
+            
+            # Process the transcribed text like a normal message
+            recent_entries = self.db.get_recent_entries(user_id, days=3)
+            context_text = "; ".join([e["content"][:100] for e in recent_entries[:3]]) if recent_entries else None
+            
+            # Show typing while processing
+            await update.message.chat.send_action("typing")
+            
+            # Analyze with Claude
+            analysis = await self.claude.analyze_message(transcribed_text, context_text)
+            
+            # Save diary entry
+            self.db.add_entry(user_id, analysis["diary_entry"], analysis["category"])
+            
+            # Process reminders
+            reminder_count = 0
+            for reminder in analysis["reminders"]:
+                reminder_date = self.parse_date(reminder["date"])
+                if reminder_date:
+                    self.db.add_reminder(user_id, reminder_date, reminder["content"])
+                    reminder_count += 1
+            
+            # Build response
+            response_parts = ["✅ Noted!"]
+            
+            if reminder_count > 0:
+                response_parts.append(f"\n⏰ Set {reminder_count} reminder(s)")
+            
+            if analysis["ideas"]:
+                response_parts.append(f"\n💡 Ideas captured: {len(analysis['ideas'])}")
+            
+            # Only call Claude again if user needs advice
+            if analysis["needs_response"] and analysis["question"]:
+                advice = await self.claude.provide_advice(
+                    analysis["question"],
+                    analysis["ideas"],
+                    context_text or ""
+                )
+                response_parts.append(f"\n\n{advice}")
+            
+            await update.message.reply_text("\n".join(response_parts))
+            
+        except Exception as e:
+            logger.error(f"Voice handling error: {e}")
+            await update.message.reply_text("❌ Sorry, something went wrong processing your voice message. Please try again!")
     
     async def show_reminders(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Show pending reminders"""
@@ -499,18 +619,21 @@ def main():
     # Load environment variables
     TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
     ANTHROPIC_KEY = os.getenv("ANTHROPIC_API_KEY")
+    OPENAI_KEY = os.getenv("OPENAI_API_KEY")
     
-    if not TELEGRAM_TOKEN or not ANTHROPIC_KEY:
-        print("ERROR: Please set TELEGRAM_BOT_TOKEN and ANTHROPIC_API_KEY environment variables")
+    if not TELEGRAM_TOKEN or not ANTHROPIC_KEY or not OPENAI_KEY:
+        print("ERROR: Please set TELEGRAM_BOT_TOKEN, ANTHROPIC_API_KEY, and OPENAI_API_KEY environment variables")
         print("\nOn Linux/Mac:")
         print("  export TELEGRAM_BOT_TOKEN='your_token_here'")
         print("  export ANTHROPIC_API_KEY='your_key_here'")
+        print("  export OPENAI_API_KEY='your_openai_key_here'")
         print("\nOn Windows:")
         print("  set TELEGRAM_BOT_TOKEN=your_token_here")
         print("  set ANTHROPIC_API_KEY=your_key_here")
+        print("  set OPENAI_API_KEY=your_openai_key_here")
         return
     
-    bot = DiaryBot(TELEGRAM_TOKEN, ANTHROPIC_KEY)
+    bot = DiaryBot(TELEGRAM_TOKEN, ANTHROPIC_KEY, OPENAI_KEY)
     bot.run()
 
 
