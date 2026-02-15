@@ -24,7 +24,6 @@ from telegram.ext import (
 import anthropic
 from openai import OpenAI
 import tempfile
-import requests
 
 # Configure logging
 logging.basicConfig(
