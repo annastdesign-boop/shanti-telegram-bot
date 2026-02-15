@@ -24,6 +24,7 @@ from telegram.ext import (
 import anthropic
 from openai import OpenAI
 import tempfile
+import requests
 
 # Configure logging
 logging.basicConfig(
@@ -76,6 +77,17 @@ class DiaryDatabase:
                 user_id INTEGER PRIMARY KEY,
                 last_summary TEXT,
                 last_updated DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
+        # Morning news preferences table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS news_preferences (
+                user_id INTEGER PRIMARY KEY,
+                enabled BOOLEAN DEFAULT 0,
+                time TIME DEFAULT '08:00',
+                topics TEXT DEFAULT 'general,technology,health',
+                timezone TEXT DEFAULT 'UTC'
             )
         """)
         
@@ -190,6 +202,48 @@ class DiaryDatabase:
         )
         conn.commit()
         conn.close()
+    
+    def set_morning_news(self, user_id: int, enabled: bool, time: str = "08:00", topics: str = "general"):
+        """Set morning news preferences"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute(
+            """INSERT INTO news_preferences (user_id, enabled, time, topics) 
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT(user_id) DO UPDATE SET 
+               enabled = ?, time = ?, topics = ?""",
+            (user_id, enabled, time, topics, enabled, time, topics)
+        )
+        conn.commit()
+        conn.close()
+    
+    def get_news_subscribers(self, current_hour: int) -> List[Dict]:
+        """Get users who should receive news at this hour"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        # Get users whose news time matches current hour
+        cursor.execute(
+            """SELECT user_id, topics FROM news_preferences 
+               WHERE enabled = 1 AND substr(time, 1, 2) = ?""",
+            (f"{current_hour:02d}",)
+        )
+        subscribers = [{"user_id": row[0], "topics": row[1]} for row in cursor.fetchall()]
+        conn.close()
+        return subscribers
+    
+    def get_news_preference(self, user_id: int) -> Optional[Dict]:
+        """Get user's news preferences"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT enabled, time, topics FROM news_preferences WHERE user_id = ?",
+            (user_id,)
+        )
+        result = cursor.fetchone()
+        conn.close()
+        if result:
+            return {"enabled": bool(result[0]), "time": result[1], "topics": result[2]}
+        return None
 
 
 class VoiceTranscriber:
@@ -250,11 +304,41 @@ class ClaudeAssistant:
         
         Uses minimal tokens by being specific in prompt
         """
-        system_prompt = """You are a personal diary assistant. Analyze the user's message and extract:
+        system_prompt = """You are a proactive personal assistant combining: life coach, project manager, therapist, and business advisor.
+
+ALWAYS provide helpful responses. Be encouraging, insightful, and actionable.
+
+Analyze the user's message and extract:
 1. Main diary content (what they did/plan to do)
 2. Any reminders/tasks with dates (extract date if mentioned)
 3. Creative ideas or goals
-4. Whether they need advice/brainstorming
+4. Whether they would benefit from coaching/advice
+5. Whether they need web search for current information
+
+NEEDS WEB SEARCH if asking about:
+- Flight prices, hotel rates, current prices
+- Current events, news, weather
+- Recent information (sports scores, stock prices)
+- Factual lookups (business hours, contact info)
+- Research requiring current data
+
+WANTS MORNING NEWS if they say:
+- "Send me news every morning"
+- "I want daily news"
+- "Can you give me morning updates?"
+Set wants_morning_news to true and extract the time if mentioned.
+
+BE GENEROUS with needs_response - set to true for:
+- Any questions (obvious or implicit)
+- Goals or ideas shared (offer guidance)
+- Challenges or problems mentioned (provide support)
+- Accomplishments (celebrate and encourage)
+- Plans mentioned (help structure them)
+- ANY situation where coaching would help
+
+ONLY set needs_response to false for:
+- Very simple status updates with no actionable element
+- Pure factual statements with no room for improvement
 
 Respond in JSON format only:
 {
@@ -262,8 +346,12 @@ Respond in JSON format only:
   "category": "work|personal|creative|health|other",
   "reminders": [{"content": "task", "date": "YYYY-MM-DD or 'today'/'tomorrow'/'tuesday' etc", "priority": "high|normal"}],
   "ideas": ["idea1", "idea2"],
-  "needs_response": true|false,
-  "question": "what they're asking if needs_response is true"
+  "needs_response": true,
+  "needs_search": false,
+  "search_query": "what to search for if needs_search is true",
+  "wants_morning_news": false,
+  "news_time": "08:00",
+  "question": "coaching opportunity: what they're working on, what they need help with, or what deserves encouragement"
 }"""
         
         user_message = message
@@ -273,7 +361,7 @@ Respond in JSON format only:
         try:
             response = self.client.messages.create(
                 model=self.model,
-                max_tokens=500,  # Keep low to minimize cost
+                max_tokens=600,  # Increased for better responses
                 system=system_prompt,
                 messages=[{"role": "user", "content": user_message}]
             )
@@ -289,29 +377,58 @@ Respond in JSON format only:
                 "reminders": [],
                 "ideas": [],
                 "needs_response": False,
+                "needs_search": False,
+                "search_query": "",
+                "wants_morning_news": False,
+                "news_time": "08:00",
                 "question": None
             }
     
     async def provide_advice(self, question: str, ideas: List[str], context: str) -> str:
-        """Provide creative advice and action plans"""
-        system_prompt = """You are a helpful personal assistant. Provide:
-1. Structured feedback on their ideas
-2. Actionable steps to achieve their goals
-3. Creative suggestions
-Keep response concise (under 200 words)."""
+        """Provide coaching, advice and action plans with Buddhist wisdom and art therapy"""
+        system_prompt = """You are an AI combining deep expertise as:
+- Life Coach: Motivation, goal-setting, habit formation
+- Therapist: Emotional support, stress management, perspective
+- Project Manager: Planning, prioritization, execution strategies  
+- Business Advisor: Strategy, growth, problem-solving
+- Indo-Tibetan Buddhist Teacher (Mahayana tradition): Wisdom from Dalai Lama, Lama Zopa Rinpoche, Urgyen Rinpoche, and other great masters
+- Art Therapist: Creative expression, healing through art, mindfulness in creativity
+
+When appropriate, weave in:
+- Buddhist concepts: compassion, impermanence, mindfulness, emptiness, bodhicitta
+- Meditation practices and contemplations
+- Art therapy techniques: drawing feelings, mandala creation, color therapy, journaling
+- Tibetan Buddhist wisdom on suffering, acceptance, loving-kindness
+- Practical dharma teachings applicable to modern life
+
+Provide personalized, actionable guidance that:
+1. Acknowledges their situation with empathy and compassion
+2. Offers spiritual perspective when helpful (without being preachy)
+3. Suggests creative/artistic approaches for emotional processing
+4. Provides practical next steps
+5. Encourages and motivates with wisdom
+6. Asks thoughtful follow-up questions when helpful
+7. Celebrates progress and wins
+
+Balance practical action with spiritual wisdom. Sometimes the answer is meditation, 
+sometimes it's a to-do list, often it's both.
+
+Tone: Warm, compassionate, wise, encouraging, grounded
+Length: 150-300 words (concise but complete)
+Format: Natural conversation, use emojis sparingly for warmth"""
         
-        user_message = f"""Context: {context}
+        user_message = f"""Recent context: {context}
 
-Ideas/Goals: {', '.join(ideas)}
+Current situation/ideas: {', '.join(ideas) if ideas else 'N/A'}
 
-Question: {question}
+What they shared: {question}
 
-Provide helpful, structured advice."""
+Provide helpful coaching with wisdom and actionable advice."""
         
         try:
             response = self.client.messages.create(
                 model=self.model,
-                max_tokens=400,
+                max_tokens=600,  # Increased for fuller responses with wisdom
                 system=system_prompt,
                 messages=[{"role": "user", "content": user_message}]
             )
@@ -319,6 +436,77 @@ Provide helpful, structured advice."""
         except Exception as e:
             logger.error(f"Claude API error: {e}")
             return "I'm having trouble connecting right now. Try again in a moment!"
+    
+    async def search_and_answer(self, query: str, context: str = "") -> str:
+        """
+        Search the web and provide answer with sources
+        Used for: flight prices, current info, research, fact-checking
+        """
+        system_prompt = """You are a helpful assistant with web search capabilities.
+        
+When the user asks about:
+- Flight prices, hotel rates, current prices
+- Current events, news, recent information  
+- Research topics requiring up-to-date data
+- Factual information that may have changed
+
+You will search the web and provide:
+1. Clear, accurate answer
+2. Relevant details
+3. Sources/links when available
+4. Practical next steps
+
+Keep responses concise (200-300 words) but informative."""
+        
+        search_query = f"""Context: {context}
+
+User query: {query}
+
+Search the web for current information and provide a helpful answer."""
+        
+        try:
+            response = self.client.messages.create(
+                model=self.model,
+                max_tokens=800,
+                system=system_prompt,
+                messages=[{"role": "user", "content": search_query}]
+            )
+            return response.content[0].text
+        except Exception as e:
+            logger.error(f"Claude API search error: {e}")
+            return "I'm having trouble searching right now. Could you try rephrasing your question?"
+    
+    async def generate_morning_news(self, topics: str = "general") -> str:
+        """Generate personalized morning news briefing"""
+        system_prompt = """You are a morning news curator. Create a brief, engaging news summary.
+
+Include:
+- Top 3-5 most important stories
+- Mix of topics: world events, technology, health, business
+- Positive story at the end
+- Brief, digestible format
+- Encouraging tone to start the day
+
+Format:
+🌅 Good Morning! Here's what's happening today:
+
+[Story summaries - 2-3 sentences each]
+
+Keep it under 300 words total. Inspiring and informative!"""
+        
+        user_message = f"Create a morning news briefing. Focus on: {topics}. Include current date context."
+        
+        try:
+            response = self.client.messages.create(
+                model=self.model,
+                max_tokens=600,
+                system=system_prompt,
+                messages=[{"role": "user", "content": user_message}]
+            )
+            return response.content[0].text
+        except Exception as e:
+            logger.error(f"Claude API news error: {e}")
+            return "☀️ Good morning! I'm having trouble fetching news right now. Have a great day!"
 
 
 class DiaryBot:
@@ -339,13 +527,15 @@ class DiaryBot:
         self.application.add_handler(CommandHandler("reminders", self.show_reminders))
         self.application.add_handler(CommandHandler("done", self.complete_reminder))
         self.application.add_handler(CommandHandler("summary", self.weekly_summary))
+        self.application.add_handler(CommandHandler("news", self.news_command))
         self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
         self.application.add_handler(MessageHandler(filters.VOICE, self.handle_voice))  # Voice messages
         
-        # Schedule reminder checks
+        # Schedule reminder checks and morning news
         job_queue = self.application.job_queue
         if job_queue:
             job_queue.run_repeating(self.check_reminders, interval=3600, first=10)  # Every hour
+            job_queue.run_repeating(self.send_morning_news, interval=3600, first=60)  # Check every hour for news
     
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /start command"""
@@ -356,12 +546,14 @@ class DiaryBot:
             "💡 Organize your creative ideas\n"
             "⏰ Remember important tasks\n"
             "🎯 Create action plans for your goals\n"
-            "🎤 Voice messages supported!\n\n"
+            "🎤 Voice messages supported!\n"
+            "📰 Morning news briefings!\n\n"
             "Just send me text or voice messages about your day, ideas, or tasks!\n\n"
             "Commands:\n"
             "/reminders - View pending reminders\n"
             "/done <id> - Mark reminder as complete\n"
             "/summary - Get weekly summary\n"
+            "/news - Setup morning news\n"
             "/help - Show this message"
         )
     
@@ -412,22 +604,51 @@ class DiaryBot:
                 reminder_count += 1
         
         # Build response
-        response_parts = ["✅ Noted!"]
+        response_parts = []
+        
+        # Handle web search if needed
+        if analysis.get("needs_search") and analysis.get("search_query"):
+            await update.message.chat.send_action("typing")
+            search_result = await self.claude.search_and_answer(
+                analysis["search_query"],
+                context_text or ""
+            )
+            response_parts.append(f"🔍 {search_result}")
+        
+        # Add confirmation with context (only if not a pure search query)
+        if not analysis.get("needs_search"):
+            if reminder_count > 0 and analysis["ideas"]:
+                response_parts.append("✅ Got it! Reminders set and ideas captured.")
+            elif reminder_count > 0:
+                response_parts.append("✅ Saved! I'll remind you about that.")
+            elif analysis["ideas"]:
+                response_parts.append("✅ Noted! Interesting ideas here.")
+            else:
+                response_parts.append("✅ Logged!")
         
         if reminder_count > 0:
-            response_parts.append(f"\n⏰ Set {reminder_count} reminder(s)")
+            response_parts.append(f"⏰ {reminder_count} reminder(s) scheduled")
         
         if analysis["ideas"]:
-            response_parts.append(f"\n💡 Ideas captured: {len(analysis['ideas'])}")
+            response_parts.append(f"💡 {len(analysis['ideas'])} idea(s) captured")
         
-        # Only call Claude again if user needs advice (saves API calls!)
-        if analysis["needs_response"] and analysis["question"]:
+        # Handle morning news request
+        if analysis.get("wants_morning_news"):
+            news_time = analysis.get("news_time", "08:00")
+            self.db.set_morning_news(user_id, True, news_time)
+            response_parts.append(
+                f"\n📰 Perfect! I'll send you morning news every day at {news_time}.\n"
+                f"You can change this anytime with /news command."
+            )
+        
+        # ALWAYS provide coaching/advice when possible (but not for pure search queries or news setup)
+        if analysis["needs_response"] and analysis["question"] and not analysis.get("needs_search") and not analysis.get("wants_morning_news"):
             advice = await self.claude.provide_advice(
                 analysis["question"],
                 analysis["ideas"],
                 context_text or ""
             )
-            response_parts.append(f"\n\n{advice}")
+            response_parts.append(f"\n{advice}")
         
         await update.message.reply_text("\n".join(response_parts))
     
@@ -482,22 +703,32 @@ class DiaryBot:
                     reminder_count += 1
             
             # Build response
-            response_parts = ["✅ Noted!"]
+            response_parts = []
+            
+            # Add confirmation with context
+            if reminder_count > 0 and analysis["ideas"]:
+                response_parts.append("✅ Got it! Reminders set and ideas captured.")
+            elif reminder_count > 0:
+                response_parts.append("✅ Saved! I'll remind you about that.")
+            elif analysis["ideas"]:
+                response_parts.append("✅ Noted! Interesting ideas here.")
+            else:
+                response_parts.append("✅ Logged!")
             
             if reminder_count > 0:
-                response_parts.append(f"\n⏰ Set {reminder_count} reminder(s)")
+                response_parts.append(f"⏰ {reminder_count} reminder(s) scheduled")
             
             if analysis["ideas"]:
-                response_parts.append(f"\n💡 Ideas captured: {len(analysis['ideas'])}")
+                response_parts.append(f"💡 {len(analysis['ideas'])} idea(s) captured")
             
-            # Only call Claude again if user needs advice
+            # ALWAYS provide coaching/advice when possible
             if analysis["needs_response"] and analysis["question"]:
                 advice = await self.claude.provide_advice(
                     analysis["question"],
                     analysis["ideas"],
                     context_text or ""
                 )
-                response_parts.append(f"\n\n{advice}")
+                response_parts.append(f"\n{advice}")
             
             await update.message.reply_text("\n".join(response_parts))
             
@@ -566,6 +797,69 @@ class DiaryBot:
         
         await update.message.reply_text(response, parse_mode='Markdown')
     
+    async def news_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /news command to setup morning news"""
+        user_id = update.effective_user.id
+        
+        # Check if they provided arguments
+        if context.args:
+            arg = context.args[0].lower()
+            
+            if arg == "on":
+                time = context.args[1] if len(context.args) > 1 else "08:00"
+                topics = " ".join(context.args[2:]) if len(context.args) > 2 else "general"
+                self.db.set_morning_news(user_id, True, time, topics)
+                await update.message.reply_text(
+                    f"📰 Morning news enabled!\n\n"
+                    f"⏰ Time: {time}\n"
+                    f"📋 Topics: {topics}\n\n"
+                    f"You'll receive a news briefing every morning.\n"
+                    f"Use /news off to disable."
+                )
+            
+            elif arg == "off":
+                self.db.set_morning_news(user_id, False)
+                await update.message.reply_text("📰 Morning news disabled.")
+            
+            elif arg == "now":
+                # Send news immediately
+                topics = " ".join(context.args[1:]) if len(context.args) > 1 else "general"
+                await update.message.chat.send_action("typing")
+                news = await self.claude.generate_morning_news(topics)
+                await update.message.reply_text(news)
+            
+            else:
+                await update.message.reply_text(
+                    "📰 **Morning News Commands:**\n\n"
+                    "/news on [time] [topics] - Enable morning news\n"
+                    "Example: /news on 07:30 technology health\n\n"
+                    "/news off - Disable morning news\n"
+                    "/news now [topics] - Get news right now\n"
+                    "/news - Check current settings",
+                    parse_mode='Markdown'
+                )
+        else:
+            # Show current settings
+            pref = self.db.get_news_preference(user_id)
+            if pref and pref["enabled"]:
+                await update.message.reply_text(
+                    f"📰 Morning News: **Enabled**\n\n"
+                    f"⏰ Time: {pref['time']}\n"
+                    f"📋 Topics: {pref['topics']}\n\n"
+                    f"Use /news off to disable\n"
+                    f"Use /news now to get news immediately",
+                    parse_mode='Markdown'
+                )
+            else:
+                await update.message.reply_text(
+                    "📰 Morning News: **Disabled**\n\n"
+                    "Want daily news briefings?\n\n"
+                    "Use: /news on [time] [topics]\n"
+                    "Example: /news on 08:00 technology health\n\n"
+                    "Or try: /news now (get news right away)",
+                    parse_mode='Markdown'
+                )
+    
     async def check_reminders(self, context: ContextTypes.DEFAULT_TYPE):
         """Background job to check and send reminders"""
         due_reminders = self.db.get_due_reminders()
@@ -580,6 +874,25 @@ class DiaryBot:
                 self.db.mark_reminder_notified(reminder["id"])
             except Exception as e:
                 logger.error(f"Failed to send reminder: {e}")
+    
+    async def send_morning_news(self, context: ContextTypes.DEFAULT_TYPE):
+        """Background job to send morning news to subscribers"""
+        current_hour = datetime.now().hour
+        subscribers = self.db.get_news_subscribers(current_hour)
+        
+        for sub in subscribers:
+            try:
+                # Generate personalized news
+                news = await self.claude.generate_morning_news(sub["topics"])
+                
+                # Send to user
+                await context.bot.send_message(
+                    chat_id=sub["user_id"],
+                    text=news
+                )
+                logger.info(f"Sent morning news to user {sub['user_id']}")
+            except Exception as e:
+                logger.error(f"Failed to send morning news: {e}")
     
     def parse_date(self, date_str: str) -> Optional[str]:
         """Parse natural language dates"""
