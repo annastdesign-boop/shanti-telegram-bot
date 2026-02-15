@@ -1,947 +1,516 @@
-#!/usr/bin/env python3
-"""
-Telegram Diary/Assistant Bot with Claude API
-Optimized for minimal API usage and cost
-"""
-
 import os
 import json
 import logging
+import tempfile
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional
-import asyncio
-import sqlite3
 from pathlib import Path
 
-from telegram import Update
+import openai
+from anthropic import Anthropic
+from telegram import Update, ForceReply
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
-    ContextTypes,
     filters,
+    ContextTypes,
 )
-import anthropic
-from openai import OpenAI
-import tempfile
 
-# Configure logging
+# ── Logging ──────────────────────────────────────────────────────────────────
 logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
 
+# ── Environment variables ────────────────────────────────────────────────────
+TELEGRAM_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
+OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 
-class DiaryDatabase:
-    """SQLite database for storing diary entries and reminders"""
-    
-    def __init__(self, db_path: str = "diary.db"):
-        self.db_path = db_path
-        self.init_db()
-    
-    def init_db(self):
-        """Initialize database with required tables"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        # Diary entries table
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS entries (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                content TEXT NOT NULL,
-                category TEXT DEFAULT 'general'
-            )
-        """)
-        
-        # Reminders table
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS reminders (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                reminder_date DATE NOT NULL,
-                reminder_time TIME,
-                content TEXT NOT NULL,
-                completed BOOLEAN DEFAULT 0,
-                notified BOOLEAN DEFAULT 0
-            )
-        """)
-        
-        # Conversation context table (to reduce API calls)
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS context (
-                user_id INTEGER PRIMARY KEY,
-                last_summary TEXT,
-                last_updated DATETIME DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        
-        # Morning news preferences table
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS news_preferences (
-                user_id INTEGER PRIMARY KEY,
-                enabled BOOLEAN DEFAULT 0,
-                time TIME DEFAULT '08:00',
-                topics TEXT DEFAULT 'general,technology,health',
-                timezone TEXT DEFAULT 'UTC'
-            )
-        """)
-        
-        conn.commit()
-        conn.close()
-    
-    def add_entry(self, user_id: int, content: str, category: str = "general"):
-        """Add a diary entry"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        cursor.execute(
-            "INSERT INTO entries (user_id, content, category) VALUES (?, ?, ?)",
-            (user_id, content, category)
-        )
-        conn.commit()
-        conn.close()
-    
-    def add_reminder(self, user_id: int, reminder_date: str, content: str, reminder_time: str = None):
-        """Add a reminder"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        cursor.execute(
-            "INSERT INTO reminders (user_id, reminder_date, reminder_time, content) VALUES (?, ?, ?, ?)",
-            (user_id, reminder_date, reminder_time, content)
-        )
-        conn.commit()
-        conn.close()
-    
-    def get_recent_entries(self, user_id: int, days: int = 7) -> List[Dict]:
-        """Get recent entries for context (limited to reduce API costs)"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        cursor.execute(
-            """SELECT timestamp, content, category FROM entries 
-               WHERE user_id = ? AND timestamp > datetime('now', '-' || ? || ' days')
-               ORDER BY timestamp DESC LIMIT 10""",
-            (user_id, days)
-        )
-        entries = [{"timestamp": row[0], "content": row[1], "category": row[2]} 
-                   for row in cursor.fetchall()]
-        conn.close()
-        return entries
-    
-    def get_pending_reminders(self, user_id: int) -> List[Dict]:
-        """Get pending reminders"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        cursor.execute(
-            """SELECT id, reminder_date, reminder_time, content FROM reminders 
-               WHERE user_id = ? AND completed = 0 
-               ORDER BY reminder_date, reminder_time""",
-            (user_id,)
-        )
-        reminders = [{"id": row[0], "date": row[1], "time": row[2], "content": row[3]} 
-                     for row in cursor.fetchall()]
-        conn.close()
-        return reminders
-    
-    def get_due_reminders(self) -> List[Dict]:
-        """Get reminders that are due for notification"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        today = datetime.now().date().isoformat()
-        cursor.execute(
-            """SELECT id, user_id, content, reminder_time FROM reminders 
-               WHERE reminder_date <= ? AND completed = 0 AND notified = 0""",
-            (today,)
-        )
-        reminders = [{"id": row[0], "user_id": row[1], "content": row[2], "time": row[3]} 
-                     for row in cursor.fetchall()]
-        conn.close()
-        return reminders
-    
-    def mark_reminder_notified(self, reminder_id: int):
-        """Mark reminder as notified"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        cursor.execute("UPDATE reminders SET notified = 1 WHERE id = ?", (reminder_id,))
-        conn.commit()
-        conn.close()
-    
-    def complete_reminder(self, reminder_id: int):
-        """Mark reminder as completed"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        cursor.execute("UPDATE reminders SET completed = 1 WHERE id = ?", (reminder_id,))
-        conn.commit()
-        conn.close()
-    
-    def get_context_summary(self, user_id: int) -> Optional[str]:
-        """Get cached context summary to reduce API calls"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT last_summary FROM context WHERE user_id = ?",
-            (user_id,)
-        )
-        result = cursor.fetchone()
-        conn.close()
-        return result[0] if result else None
-    
-    def update_context_summary(self, user_id: int, summary: str):
-        """Update cached context summary"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        cursor.execute(
-            """INSERT INTO context (user_id, last_summary, last_updated) 
-               VALUES (?, ?, CURRENT_TIMESTAMP)
-               ON CONFLICT(user_id) DO UPDATE SET 
-               last_summary = ?, last_updated = CURRENT_TIMESTAMP""",
-            (user_id, summary, summary)
-        )
-        conn.commit()
-        conn.close()
-    
-    def set_morning_news(self, user_id: int, enabled: bool, time: str = "08:00", topics: str = "general"):
-        """Set morning news preferences"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        cursor.execute(
-            """INSERT INTO news_preferences (user_id, enabled, time, topics) 
-               VALUES (?, ?, ?, ?)
-               ON CONFLICT(user_id) DO UPDATE SET 
-               enabled = ?, time = ?, topics = ?""",
-            (user_id, enabled, time, topics, enabled, time, topics)
-        )
-        conn.commit()
-        conn.close()
-    
-    def get_news_subscribers(self, current_hour: int) -> List[Dict]:
-        """Get users who should receive news at this hour"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        # Get users whose news time matches current hour
-        cursor.execute(
-            """SELECT user_id, topics FROM news_preferences 
-               WHERE enabled = 1 AND substr(time, 1, 2) = ?""",
-            (f"{current_hour:02d}",)
-        )
-        subscribers = [{"user_id": row[0], "topics": row[1]} for row in cursor.fetchall()]
-        conn.close()
-        return subscribers
-    
-    def get_news_preference(self, user_id: int) -> Optional[Dict]:
-        """Get user's news preferences"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT enabled, time, topics FROM news_preferences WHERE user_id = ?",
-            (user_id,)
-        )
-        result = cursor.fetchone()
-        conn.close()
-        if result:
-            return {"enabled": bool(result[0]), "time": result[1], "topics": result[2]}
-        return None
+# Optional: restrict bot to your user ID only
+ALLOWED_USER_ID = os.environ.get("ALLOWED_USER_ID")  # e.g. "123456789"
+
+# ── Clients ──────────────────────────────────────────────────────────────────
+anthropic_client = Anthropic(api_key=ANTHROPIC_API_KEY)
+openai_client = openai.OpenAI(api_key=OPENAI_API_KEY)
+
+# ── Persistent storage (simple JSON file) ────────────────────────────────────
+DATA_DIR = Path("data")
+DATA_DIR.mkdir(exist_ok=True)
+SCHEDULE_FILE = DATA_DIR / "schedule.json"
+CONVERSATION_FILE = DATA_DIR / "conversations.json"
 
 
-class VoiceTranscriber:
-    """OpenAI Whisper API integration for voice-to-text"""
+def load_json(path: Path, default=None):
+    if default is None:
+        default = {}
+    if path.exists():
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return default
+
+
+def save_json(path: Path, data):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+# ── Per-user conversation history ────────────────────────────────────────────
+# In-memory store: { user_id_str: [ {role, content}, ... ] }
+user_conversations: dict[str, list[dict]] = {}
+
+MAX_HISTORY = 40  # max messages to keep per user in context window
+
+
+def get_history(user_id: int) -> list[dict]:
+    uid = str(user_id)
+    if uid not in user_conversations:
+        user_conversations[uid] = []
+    return user_conversations[uid]
+
+
+def append_message(user_id: int, role: str, content: str):
+    history = get_history(user_id)
+    history.append({"role": role, "content": content})
+    # trim to last MAX_HISTORY messages
+    if len(history) > MAX_HISTORY:
+        user_conversations[str(user_id)] = history[-MAX_HISTORY:]
+
+
+# ── Schedule helpers ─────────────────────────────────────────────────────────
+def load_schedule() -> dict:
+    """{ 'YYYY-MM-DD': [ { 'time': '...', 'task': '...', 'notes': '...' }, ... ] }"""
+    return load_json(SCHEDULE_FILE, {})
+
+
+def save_schedule(schedule: dict):
+    save_json(SCHEDULE_FILE, schedule)
+
+
+def get_today_key() -> str:
+    return datetime.now().strftime("%Y-%m-%d")
+
+
+def get_today_schedule_text() -> str:
+    schedule = load_schedule()
+    today = get_today_key()
+    items = schedule.get(today, [])
+    if not items:
+        return f"No plans scheduled for today ({today})."
+    lines = [f"📅 **Schedule for {today}:**"]
+    for i, item in enumerate(items, 1):
+        time_str = item.get("time", "no specific time")
+        task = item.get("task", "")
+        notes = item.get("notes", "")
+        line = f"{i}. [{time_str}] {task}"
+        if notes:
+            line += f" — {notes}"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def get_week_schedule_text() -> str:
+    schedule = load_schedule()
+    today = datetime.now()
+    lines = ["📅 **This week's schedule:**"]
+    found_anything = False
+    for delta in range(7):
+        day = today + timedelta(days=delta)
+        key = day.strftime("%Y-%m-%d")
+        day_name = day.strftime("%A %b %d")
+        items = schedule.get(key, [])
+        if items:
+            found_anything = True
+            lines.append(f"\n**{day_name}:**")
+            for i, item in enumerate(items, 1):
+                time_str = item.get("time", "")
+                task = item.get("task", "")
+                line = f"  {i}. [{time_str}] {task}" if time_str else f"  {i}. {task}"
+                lines.append(line)
+    if not found_anything:
+        lines.append("Nothing scheduled for the next 7 days.")
+    return "\n".join(lines)
+
+
+# ── System prompt ────────────────────────────────────────────────────────────
+def build_system_prompt(user_id: int) -> str:
+    today_schedule = get_today_schedule_text()
+    today = datetime.now().strftime("%A, %B %d, %Y")
+    current_time = datetime.now().strftime("%H:%M")
+
+    return f"""You are Shanti — a warm, intelligent personal assistant for your user. You are NOT a generic chatbot. You are deeply personal, context-aware, and proactive.
+
+Current date: {today}
+Current time: {current_time}
+
+── YOUR CORE CAPABILITIES ──
+
+1. **SCHEDULING & PLANNING**
+   - When the user mentions plans, appointments, tasks, or anything time-related, you EXTRACT the structured data and call it out clearly.
+   - You respond with a confirmation AND output a JSON block that the system will parse.
+   - Format for adding schedule items (put this at the END of your message, after your conversational response):
+     ```SCHEDULE_ADD
+     {{"date": "YYYY-MM-DD", "time": "HH:MM", "task": "description", "notes": "optional"}}
+     ```
+   - If the user says something like "tomorrow I have a meeting at 3pm about the project" — you confirm it warmly AND include the SCHEDULE_ADD block.
+   - If the time is vague (like "morning"), make a reasonable estimate and note it.
+   - If the date is vague (like "tomorrow", "next Monday"), calculate the actual date from today's date.
+
+2. **DAILY SUMMARY**
+   - When asked for a summary, plan for the day, or "what do I have today" — provide the schedule in a clean, readable format with any advice or reminders.
+   
+3. **THOUGHT STRUCTURING**
+   - When the user dumps random thoughts, brain dumps, ideas, or stream-of-consciousness text/voice notes — you STRUCTURE it.
+   - Organize into: key themes, action items, ideas to revisit, and emotional check-in if relevant.
+   - Be thoughtful, not robotic. Reflect back what you notice.
+
+4. **VOICE NOTES**
+   - Voice messages are transcribed and sent to you. They may be messy, unstructured, with filler words. That's fine.
+   - Treat voice messages as brain dumps unless they clearly contain specific requests.
+   - Always acknowledge that you received a voice note and structure the content.
+
+5. **REMOVING/EDITING SCHEDULE**
+   - If the user wants to remove or change a scheduled item, output:
+     ```SCHEDULE_REMOVE
+     {{"date": "YYYY-MM-DD", "task_keyword": "keyword to match"}}
+     ```
+   - Or for editing:
+     ```SCHEDULE_EDIT
+     {{"date": "YYYY-MM-DD", "task_keyword": "old keyword", "new_time": "HH:MM", "new_task": "new description"}}
+     ```
+
+── TODAY'S SCHEDULE ──
+{today_schedule}
+
+── PERSONALITY ──
+- Warm, supportive, slightly witty
+- You remember context from the conversation
+- You're proactive: if someone mentions a deadline, remind them; if plans conflict, flag it
+- Keep responses concise but thorough — no fluff, no generic AI phrases
+- If you don't have enough info, ask a clarifying question
+- Use emoji sparingly but naturally
+- When the user is clearly just chatting/venting, be a good listener first, structurer second
+
+── IMPORTANT RULES ──
+- NEVER say "As an AI language model..." or similar disclaimers
+- NEVER give generic responses. Always reference the user's actual context
+- If you detect scheduling intent, ALWAYS include the SCHEDULE_ADD block
+- The SCHEDULE blocks are parsed by code — they MUST be valid JSON
+- Today is {today}. Calculate dates correctly.
+"""
+
+
+# ── Claude API call ──────────────────────────────────────────────────────────
+def ask_claude(user_id: int, user_message: str) -> str:
+    system_prompt = build_system_prompt(user_id)
     
-    def __init__(self, api_key: str):
-        self.client = OpenAI(api_key=api_key)
+    # Add user message to history
+    append_message(user_id, "user", user_message)
     
-    async def transcribe_voice(self, voice_file_bytes: bytes, filename: str = "voice.ogg") -> Optional[str]:
-        """
-        Transcribe voice message to text using Whisper API
+    # Build messages for API
+    messages = get_history(user_id)
+    
+    try:
+        response = anthropic_client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=2048,
+            system=system_prompt,
+            messages=messages,
+        )
         
-        Args:
-            voice_file_bytes: Audio file bytes from Telegram
-            filename: Original filename (default: voice.ogg)
+        assistant_text = response.content[0].text
         
-        Returns:
-            Transcribed text or None if error
-        """
+        # Save assistant response to history
+        append_message(user_id, "assistant", assistant_text)
+        
+        # Process any schedule commands in the response
+        process_schedule_commands(assistant_text)
+        
+        # Clean the response (remove schedule command blocks from what user sees)
+        clean_text = clean_response(assistant_text)
+        
+        return clean_text
+        
+    except Exception as e:
+        logger.error(f"Claude API error: {e}")
+        return f"⚠️ Something went wrong talking to Claude: {str(e)[:200]}"
+
+
+# ── Schedule command processing ──────────────────────────────────────────────
+def process_schedule_commands(text: str):
+    schedule = load_schedule()
+    changed = False
+
+    # Process SCHEDULE_ADD
+    if "```SCHEDULE_ADD" in text:
         try:
-            # Create a temporary file for the audio
-            with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as temp_audio:
-                temp_audio.write(voice_file_bytes)
-                temp_audio_path = temp_audio.name
-            
-            # Transcribe using Whisper (run sync operation in executor to not block)
-            loop = asyncio.get_event_loop()
-            transcript = await loop.run_in_executor(
-                None,
-                self._transcribe_sync,
-                temp_audio_path
-            )
-            
-            # Clean up temp file
+            block = text.split("```SCHEDULE_ADD")[1].split("```")[0].strip()
+            data = json.loads(block)
+            date_key = data["date"]
+            entry = {
+                "time": data.get("time", ""),
+                "task": data.get("task", ""),
+                "notes": data.get("notes", ""),
+            }
+            if date_key not in schedule:
+                schedule[date_key] = []
+            schedule[date_key].append(entry)
+            # Sort by time
+            schedule[date_key].sort(key=lambda x: x.get("time", "99:99"))
+            changed = True
+            logger.info(f"Added schedule item: {entry} on {date_key}")
+        except (json.JSONDecodeError, KeyError, IndexError) as e:
+            logger.error(f"Failed to parse SCHEDULE_ADD: {e}")
+
+    # Process SCHEDULE_REMOVE
+    if "```SCHEDULE_REMOVE" in text:
+        try:
+            block = text.split("```SCHEDULE_REMOVE")[1].split("```")[0].strip()
+            data = json.loads(block)
+            date_key = data["date"]
+            keyword = data.get("task_keyword", "").lower()
+            if date_key in schedule:
+                original_len = len(schedule[date_key])
+                schedule[date_key] = [
+                    item for item in schedule[date_key]
+                    if keyword not in item.get("task", "").lower()
+                ]
+                if len(schedule[date_key]) < original_len:
+                    changed = True
+                    logger.info(f"Removed schedule item matching '{keyword}' on {date_key}")
+        except (json.JSONDecodeError, KeyError, IndexError) as e:
+            logger.error(f"Failed to parse SCHEDULE_REMOVE: {e}")
+
+    # Process SCHEDULE_EDIT
+    if "```SCHEDULE_EDIT" in text:
+        try:
+            block = text.split("```SCHEDULE_EDIT")[1].split("```")[0].strip()
+            data = json.loads(block)
+            date_key = data["date"]
+            keyword = data.get("task_keyword", "").lower()
+            if date_key in schedule:
+                for item in schedule[date_key]:
+                    if keyword in item.get("task", "").lower():
+                        if "new_time" in data:
+                            item["time"] = data["new_time"]
+                        if "new_task" in data:
+                            item["task"] = data["new_task"]
+                        changed = True
+                        logger.info(f"Edited schedule item matching '{keyword}' on {date_key}")
+                        break
+                schedule[date_key].sort(key=lambda x: x.get("time", "99:99"))
+        except (json.JSONDecodeError, KeyError, IndexError) as e:
+            logger.error(f"Failed to parse SCHEDULE_EDIT: {e}")
+
+    if changed:
+        save_schedule(schedule)
+
+
+def clean_response(text: str) -> str:
+    """Remove SCHEDULE command blocks from the user-facing response."""
+    clean = text
+    for tag in ["SCHEDULE_ADD", "SCHEDULE_REMOVE", "SCHEDULE_EDIT"]:
+        while f"```{tag}" in clean:
             try:
-                os.unlink(temp_audio_path)
-            except:
-                pass  # Ignore cleanup errors
-            
-            return transcript.strip() if transcript else None
-            
-        except Exception as e:
-            logger.error(f"Whisper transcription error: {e}")
-            logger.error(f"Error details: {str(e)}")
-            return None
-    
-    def _transcribe_sync(self, audio_path: str) -> str:
-        """Synchronous transcription helper"""
-        with open(audio_path, "rb") as audio_file:
-            transcript = self.client.audio.transcriptions.create(
+                before = clean.split(f"```{tag}")[0]
+                after = clean.split(f"```{tag}")[1].split("```", 1)
+                remaining = after[1] if len(after) > 1 else ""
+                clean = before + remaining
+            except IndexError:
+                break
+    # Clean up extra whitespace
+    while "\n\n\n" in clean:
+        clean = clean.replace("\n\n\n", "\n\n")
+    return clean.strip()
+
+
+# ── Voice transcription ──────────────────────────────────────────────────────
+async def transcribe_voice(file_path: str) -> str:
+    try:
+        with open(file_path, "rb") as audio_file:
+            transcript = openai_client.audio.transcriptions.create(
                 model="whisper-1",
                 file=audio_file,
-                response_format="text"
+                response_format="text",
             )
         return transcript
-
-
-class ClaudeAssistant:
-    """Claude API integration optimized for minimal token usage"""
-    
-    def __init__(self, api_key: str):
-        self.client = anthropic.Anthropic(api_key=api_key)
-        self.model = "claude-sonnet-4-5-20250929"  # Better quality for conversations!
-    
-    async def analyze_message(self, message: str, context: Optional[str] = None) -> Dict:
-        """Simple conversational response without JSON complexity"""
-        system_prompt = """You are a warm personal assistant - life coach, therapist, Buddhist teacher, and friend.
-
-Respond naturally and helpfully to what they share. Include:
-- Empathy and understanding
-- Practical advice when relevant  
-- Buddhist wisdom when appropriate
-- Encouragement and support
-- Follow-up questions
-
-Be conversational and warm - 150-400 words."""
-        
-        user_message = message
-        if context:
-            user_message = f"Recent: {context}\n\nNow: {message}"
-        
-        try:
-            # Get simple conversational response
-            resp = self.client.messages.create(
-                model=self.model,
-                max_tokens=1000,
-                system=system_prompt,
-                messages=[{"role": "user", "content": user_message}]
-            )
-            
-            ai_response = resp.content[0].text.strip()
-            
-            # Simple keyword extraction
-            msg_lower = message.lower()
-            reminders = []
-            ideas = []
-            
-            # Check for reminders
-            days = ["tomorrow", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
-            if any(day in msg_lower for day in days) and any(word in msg_lower for word in ["remind", "need to", "have to", "must", "should"]):
-                date = next((day for day in days if day in msg_lower), "tomorrow")
-                reminders.append({"content": message[:100], "date": date, "priority": "normal"})
-            
-            # Check for ideas
-            if any(word in msg_lower for word in ["want to", "thinking about", "idea", "plan to", "should i"]):
-                ideas.append(message[:100])
-            
-            # Check for news request
-            wants_news = any(phrase in msg_lower for phrase in ["morning news", "daily news", "news every"])
-            
-            # Simple categorization
-            if any(w in msg_lower for w in ["work", "job", "career", "meeting"]):
-                category = "work"
-            elif any(w in msg_lower for w in ["health", "exercise", "tired", "sick"]):
-                category = "health"
-            elif any(w in msg_lower for w in ["create", "art", "write", "design"]):
-                category = "creative"
-            else:
-                category = "personal"
-            
-            return {
-                "response": ai_response,
-                "diary_entry": message[:200],
-                "category": category,
-                "reminders": reminders,
-                "ideas": ideas,
-                "wants_morning_news": wants_news,
-                "news_time": "08:00"
-            }
-        except Exception as e:
-            logger.error(f"API error: {e}")
-            return {
-                "response": "I'm here! Tell me what's on your mind and I'll help however I can. 💭",
-                "diary_entry": message,
-                "category": "general",
-                "reminders": [],
-                "ideas": [],
-                "wants_morning_news": False,
-                "news_time": "08:00"
-            }
-
-    async def provide_advice(self, question: str, ideas: List[str], context: str) -> str:
-        """Provide coaching, advice and action plans with Buddhist wisdom and art therapy"""
-        system_prompt = """You are an AI combining deep expertise as:
-- Life Coach: Motivation, goal-setting, habit formation
-- Therapist: Emotional support, stress management, perspective
-- Project Manager: Planning, prioritization, execution strategies  
-- Business Advisor: Strategy, growth, problem-solving
-- Indo-Tibetan Buddhist Teacher (Mahayana tradition): Wisdom from Dalai Lama, Lama Zopa Rinpoche, Urgyen Rinpoche, and other great masters
-- Art Therapist: Creative expression, healing through art, mindfulness in creativity
-
-When appropriate, weave in:
-- Buddhist concepts: compassion, impermanence, mindfulness, emptiness, bodhicitta
-- Meditation practices and contemplations
-- Art therapy techniques: drawing feelings, mandala creation, color therapy, journaling
-- Tibetan Buddhist wisdom on suffering, acceptance, loving-kindness
-- Practical dharma teachings applicable to modern life
-
-Provide personalized, actionable guidance that:
-1. Acknowledges their situation with empathy and compassion
-2. Offers spiritual perspective when helpful (without being preachy)
-3. Suggests creative/artistic approaches for emotional processing
-4. Provides practical next steps
-5. Encourages and motivates with wisdom
-6. Asks thoughtful follow-up questions when helpful
-7. Celebrates progress and wins
-
-Balance practical action with spiritual wisdom. Sometimes the answer is meditation, 
-sometimes it's a to-do list, often it's both.
-
-Tone: Warm, compassionate, wise, encouraging, grounded
-Length: 150-300 words (concise but complete)
-Format: Natural conversation, use emojis sparingly for warmth"""
-        
-        user_message = f"""Recent context: {context}
-
-Current situation/ideas: {', '.join(ideas) if ideas else 'N/A'}
-
-What they shared: {question}
-
-Provide helpful coaching with wisdom and actionable advice."""
-        
-        try:
-            response = self.client.messages.create(
-                model=self.model,
-                max_tokens=600,  # Increased for fuller responses with wisdom
-                system=system_prompt,
-                messages=[{"role": "user", "content": user_message}]
-            )
-            return response.content[0].text
-        except Exception as e:
-            logger.error(f"Claude API error: {e}")
-            return "I'm having trouble connecting right now. Try again in a moment!"
-    
-    async def search_and_answer(self, query: str, context: str = "") -> str:
-        """
-        Search the web and provide answer with sources
-        Used for: flight prices, current info, research, fact-checking
-        """
-        system_prompt = """You are a helpful assistant with web search capabilities.
-        
-When the user asks about:
-- Flight prices, hotel rates, current prices
-- Current events, news, recent information  
-- Research topics requiring up-to-date data
-- Factual information that may have changed
-
-You will search the web and provide:
-1. Clear, accurate answer
-2. Relevant details
-3. Sources/links when available
-4. Practical next steps
-
-Keep responses concise (200-300 words) but informative."""
-        
-        search_query = f"""Context: {context}
-
-User query: {query}
-
-Search the web for current information and provide a helpful answer."""
-        
-        try:
-            response = self.client.messages.create(
-                model=self.model,
-                max_tokens=800,
-                system=system_prompt,
-                messages=[{"role": "user", "content": search_query}]
-            )
-            return response.content[0].text
-        except Exception as e:
-            logger.error(f"Claude API search error: {e}")
-            return "I'm having trouble searching right now. Could you try rephrasing your question?"
-    
-    async def generate_morning_news(self, topics: str = "general") -> str:
-        """Generate personalized morning news briefing"""
-        system_prompt = """You are a morning news curator. Create a brief, engaging news summary.
-
-Include:
-- Top 3-5 most important stories
-- Mix of topics: world events, technology, health, business
-- Positive story at the end
-- Brief, digestible format
-- Encouraging tone to start the day
-
-Format:
-🌅 Good Morning! Here's what's happening today:
-
-[Story summaries - 2-3 sentences each]
-
-Keep it under 300 words total. Inspiring and informative!"""
-        
-        user_message = f"Create a morning news briefing. Focus on: {topics}. Include current date context."
-        
-        try:
-            response = self.client.messages.create(
-                model=self.model,
-                max_tokens=600,
-                system=system_prompt,
-                messages=[{"role": "user", "content": user_message}]
-            )
-            return response.content[0].text
-        except Exception as e:
-            logger.error(f"Claude API news error: {e}")
-            return "☀️ Good morning! I'm having trouble fetching news right now. Have a great day!"
-
-
-class DiaryBot:
-    """Main Telegram bot class"""
-    
-    # Add __weakref__ slot to support weak references in Python 3.13
-    __slots__ = ('db', 'claude', 'whisper', 'application', '__weakref__')
-    
-    def __init__(self, telegram_token: str, anthropic_key: str, openai_key: str):
-        self.db = DiaryDatabase()
-        self.claude = ClaudeAssistant(anthropic_key)
-        self.whisper = VoiceTranscriber(openai_key)
-        self.application = Application.builder().token(telegram_token).build()
-        
-        # Add handlers
-        self.application.add_handler(CommandHandler("start", self.start_command))
-        self.application.add_handler(CommandHandler("help", self.help_command))
-        self.application.add_handler(CommandHandler("reminders", self.show_reminders))
-        self.application.add_handler(CommandHandler("done", self.complete_reminder))
-        self.application.add_handler(CommandHandler("summary", self.weekly_summary))
-        self.application.add_handler(CommandHandler("news", self.news_command))
-        self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
-        self.application.add_handler(MessageHandler(filters.VOICE, self.handle_voice))  # Voice messages
-        
-        # Schedule reminder checks and morning news
-        job_queue = self.application.job_queue
-        if job_queue:
-            job_queue.run_repeating(self.check_reminders, interval=3600, first=10)  # Every hour
-            job_queue.run_repeating(self.send_morning_news, interval=3600, first=60)  # Check every hour for news
-    
-    async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /start command"""
-        await update.message.reply_text(
-            "👋 Welcome to your Personal Diary Assistant!\n\n"
-            "I'll help you:\n"
-            "✍️ Keep a diary of your thoughts and plans\n"
-            "💡 Organize your creative ideas\n"
-            "⏰ Remember important tasks\n"
-            "🎯 Create action plans for your goals\n"
-            "🎤 Voice messages supported!\n"
-            "📰 Morning news briefings!\n\n"
-            "Just send me text or voice messages about your day, ideas, or tasks!\n\n"
-            "Commands:\n"
-            "/reminders - View pending reminders\n"
-            "/done <id> - Mark reminder as complete\n"
-            "/summary - Get weekly summary\n"
-            "/news - Setup morning news\n"
-            "/help - Show this message"
-        )
-    
-    async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /help command"""
-        await update.message.reply_text(
-            "📖 **How to use your diary assistant:**\n\n"
-            "**Diary Entries:**\n"
-            "Just type what you did today or your plans\n"
-            "_Example: Today I finished the project presentation_\n\n"
-            "**Reminders:**\n"
-            "Mention tasks with dates\n"
-            "_Example: I need to register for yoga class on Tuesday_\n\n"
-            "**Creative Ideas:**\n"
-            "Share your ideas and ask for help\n"
-            "_Example: I want to start a blog about cooking. How should I begin?_\n\n"
-            "**Commands:**\n"
-            "/reminders - See all pending tasks\n"
-            "/done <number> - Mark task complete\n"
-            "/summary - Get this week's overview",
-            parse_mode='Markdown'
-        )
-    
-    async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle incoming messages"""
-        user_id = update.effective_user.id
-        message = update.message.text
-        
-        # Show typing indicator
-        await update.message.chat.send_action("typing")
-        
-        # Get recent context (minimal to save tokens)
-        recent_entries = self.db.get_recent_entries(user_id, days=3)
-        context_text = "; ".join([e["content"][:100] for e in recent_entries[:3]]) if recent_entries else None
-        
-        # Analyze with Claude (optimized prompt)
-        analysis = await self.claude.analyze_message(message, context_text)
-        
-        # Save diary entry
-        self.db.add_entry(user_id, analysis["diary_entry"], analysis["category"])
-        
-        # Process reminders
-        reminder_count = 0
-        for reminder in analysis["reminders"]:
-            reminder_date = self.parse_date(reminder["date"])
-            if reminder_date:
-                self.db.add_reminder(user_id, reminder_date, reminder["content"])
-                reminder_count += 1
-        
-        # Get the AI's conversational response (it's already in the analysis!)
-        ai_response = analysis.get("response", "")
-        
-        # Build response parts
-        response_parts = []
-        
-        # Add metadata tags if relevant
-        metadata = []
-        if reminder_count > 0:
-            metadata.append(f"⏰ {reminder_count} reminder(s) set")
-        if analysis.get("ideas"):
-            metadata.append(f"💡 {len(analysis['ideas'])} idea(s) captured")
-        
-        if metadata:
-            response_parts.append(" | ".join(metadata))
-        
-        # Add the main conversational response (THIS IS THE KEY!)
-        if ai_response:
-            response_parts.append(f"\n{ai_response}")
-        else:
-            # Fallback if somehow response is empty
-            response_parts.append("\nI'm here and listening! Tell me more. 💭")
-        
-        # Handle morning news request
-        if analysis.get("wants_morning_news"):
-            news_time = analysis.get("news_time", "08:00")
-            self.db.set_morning_news(user_id, True, news_time)
-            response_parts.append(
-                f"\n📰 I'll send you morning news every day at {news_time}!"
-            )
-        
-        await update.message.reply_text("\n".join(response_parts))
-    
-    async def handle_voice(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle incoming voice messages"""
-        user_id = update.effective_user.id
-        
-        # Show typing indicator
-        await update.message.chat.send_action("typing")
-        
-        try:
-            # Download voice file
-            voice = update.message.voice
-            voice_file = await voice.get_file()
-            voice_bytes = await voice_file.download_as_bytearray()
-            
-            # Send processing message
-            processing_msg = await update.message.reply_text("🎤 Transcribing your voice message...")
-            
-            # Transcribe with Whisper
-            transcribed_text = await self.whisper.transcribe_voice(bytes(voice_bytes))
-            
-            if not transcribed_text:
-                await processing_msg.edit_text("❌ Sorry, I couldn't transcribe that. Please try again or send a text message.")
-                return
-            
-            # Delete processing message
-            await processing_msg.delete()
-            
-            # Show what was transcribed
-            await update.message.reply_text(f"🎤 You said:\n\n_{transcribed_text}_", parse_mode='Markdown')
-            
-            # Process the transcribed text like a normal message
-            recent_entries = self.db.get_recent_entries(user_id, days=3)
-            context_text = "; ".join([e["content"][:100] for e in recent_entries[:3]]) if recent_entries else None
-            
-            # Show typing while processing
-            await update.message.chat.send_action("typing")
-            
-            # Analyze with Claude
-            analysis = await self.claude.analyze_message(transcribed_text, context_text)
-            
-            # Save diary entry
-            self.db.add_entry(user_id, analysis["diary_entry"], analysis["category"])
-            
-            # Process reminders
-            reminder_count = 0
-            for reminder in analysis["reminders"]:
-                reminder_date = self.parse_date(reminder["date"])
-                if reminder_date:
-                    self.db.add_reminder(user_id, reminder_date, reminder["content"])
-                    reminder_count += 1
-            
-            # Build response
-            response_parts = []
-            
-            # Add confirmation with context
-            if reminder_count > 0 and analysis["ideas"]:
-                response_parts.append("✅ Got it! Reminders set and ideas captured.")
-            elif reminder_count > 0:
-                response_parts.append("✅ Saved! I'll remind you about that.")
-            elif analysis["ideas"]:
-                response_parts.append("✅ Noted! Interesting ideas here.")
-            else:
-                response_parts.append("✅ Logged!")
-            
-            if reminder_count > 0:
-                response_parts.append(f"⏰ {reminder_count} reminder(s) scheduled")
-            
-            if analysis["ideas"]:
-                response_parts.append(f"💡 {len(analysis['ideas'])} idea(s) captured")
-            
-            # ALWAYS provide coaching/advice when possible
-            if analysis["needs_response"] and analysis["question"]:
-                advice = await self.claude.provide_advice(
-                    analysis["question"],
-                    analysis["ideas"],
-                    context_text or ""
-                )
-                response_parts.append(f"\n{advice}")
-            
-            await update.message.reply_text("\n".join(response_parts))
-            
-        except Exception as e:
-            logger.error(f"Voice handling error: {e}")
-            error_msg = str(e)
-            if "openai" in error_msg.lower() or "whisper" in error_msg.lower():
-                await update.message.reply_text(
-                    "❌ Voice transcription isn't set up yet. "
-                    "Please send text messages for now, or ask me to help set up OpenAI!"
-                )
-            else:
-                await update.message.reply_text(
-                    f"❌ Sorry, something went wrong: {error_msg[:100]}\n"
-                    "Try sending a text message instead!"
-                )
-    
-    async def show_reminders(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Show pending reminders"""
-        user_id = update.effective_user.id
-        reminders = self.db.get_pending_reminders(user_id)
-        
-        if not reminders:
-            await update.message.reply_text("📭 No pending reminders!")
-            return
-        
-        response = "⏰ **Your Reminders:**\n\n"
-        for i, reminder in enumerate(reminders, 1):
-            date = reminder["date"]
-            time = f" at {reminder['time']}" if reminder["time"] else ""
-            response += f"{i}. {reminder['content']}\n   📅 {date}{time}\n\n"
-        
-        response += "\nUse /done <number> to mark as complete"
-        await update.message.reply_text(response, parse_mode='Markdown')
-    
-    async def complete_reminder(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Mark reminder as complete"""
-        user_id = update.effective_user.id
-        
-        try:
-            reminder_num = int(context.args[0])
-            reminders = self.db.get_pending_reminders(user_id)
-            
-            if 1 <= reminder_num <= len(reminders):
-                reminder_id = reminders[reminder_num - 1]["id"]
-                self.db.complete_reminder(reminder_id)
-                await update.message.reply_text("✅ Reminder marked as complete!")
-            else:
-                await update.message.reply_text("❌ Invalid reminder number")
-        except (IndexError, ValueError):
-            await update.message.reply_text("Usage: /done <number>")
-    
-    async def weekly_summary(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Provide weekly summary without calling API (saves money)"""
-        user_id = update.effective_user.id
-        entries = self.db.get_recent_entries(user_id, days=7)
-        reminders = self.db.get_pending_reminders(user_id)
-        
-        if not entries:
-            await update.message.reply_text("📭 No entries this week!")
-            return
-        
-        response = f"📊 **This Week's Summary**\n\n"
-        response += f"✍️ {len(entries)} diary entries\n"
-        response += f"⏰ {len(reminders)} pending reminders\n\n"
-        
-        # Group by category
-        categories = {}
-        for entry in entries:
-            cat = entry["category"]
-            categories[cat] = categories.get(cat, 0) + 1
-        
-        response += "**Categories:**\n"
-        for cat, count in categories.items():
-            response += f"• {cat}: {count}\n"
-        
-        await update.message.reply_text(response, parse_mode='Markdown')
-    
-    async def news_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /news command to setup morning news"""
-        user_id = update.effective_user.id
-        
-        # Check if they provided arguments
-        if context.args:
-            arg = context.args[0].lower()
-            
-            if arg == "on":
-                time = context.args[1] if len(context.args) > 1 else "08:00"
-                topics = " ".join(context.args[2:]) if len(context.args) > 2 else "general"
-                self.db.set_morning_news(user_id, True, time, topics)
-                await update.message.reply_text(
-                    f"📰 Morning news enabled!\n\n"
-                    f"⏰ Time: {time}\n"
-                    f"📋 Topics: {topics}\n\n"
-                    f"You'll receive a news briefing every morning.\n"
-                    f"Use /news off to disable."
-                )
-            
-            elif arg == "off":
-                self.db.set_morning_news(user_id, False)
-                await update.message.reply_text("📰 Morning news disabled.")
-            
-            elif arg == "now":
-                # Send news immediately
-                topics = " ".join(context.args[1:]) if len(context.args) > 1 else "general"
-                await update.message.chat.send_action("typing")
-                news = await self.claude.generate_morning_news(topics)
-                await update.message.reply_text(news)
-            
-            else:
-                await update.message.reply_text(
-                    "📰 **Morning News Commands:**\n\n"
-                    "/news on [time] [topics] - Enable morning news\n"
-                    "Example: /news on 07:30 technology health\n\n"
-                    "/news off - Disable morning news\n"
-                    "/news now [topics] - Get news right now\n"
-                    "/news - Check current settings",
-                    parse_mode='Markdown'
-                )
-        else:
-            # Show current settings
-            pref = self.db.get_news_preference(user_id)
-            if pref and pref["enabled"]:
-                await update.message.reply_text(
-                    f"📰 Morning News: **Enabled**\n\n"
-                    f"⏰ Time: {pref['time']}\n"
-                    f"📋 Topics: {pref['topics']}\n\n"
-                    f"Use /news off to disable\n"
-                    f"Use /news now to get news immediately",
-                    parse_mode='Markdown'
-                )
-            else:
-                await update.message.reply_text(
-                    "📰 Morning News: **Disabled**\n\n"
-                    "Want daily news briefings?\n\n"
-                    "Use: /news on [time] [topics]\n"
-                    "Example: /news on 08:00 technology health\n\n"
-                    "Or try: /news now (get news right away)",
-                    parse_mode='Markdown'
-                )
-    
-    async def check_reminders(self, context: ContextTypes.DEFAULT_TYPE):
-        """Background job to check and send reminders"""
-        due_reminders = self.db.get_due_reminders()
-        
-        for reminder in due_reminders:
-            try:
-                await context.bot.send_message(
-                    chat_id=reminder["user_id"],
-                    text=f"⏰ **Reminder!**\n\n{reminder['content']}",
-                    parse_mode='Markdown'
-                )
-                self.db.mark_reminder_notified(reminder["id"])
-            except Exception as e:
-                logger.error(f"Failed to send reminder: {e}")
-    
-    async def send_morning_news(self, context: ContextTypes.DEFAULT_TYPE):
-        """Background job to send morning news to subscribers"""
-        current_hour = datetime.now().hour
-        subscribers = self.db.get_news_subscribers(current_hour)
-        
-        for sub in subscribers:
-            try:
-                # Generate personalized news
-                news = await self.claude.generate_morning_news(sub["topics"])
-                
-                # Send to user
-                await context.bot.send_message(
-                    chat_id=sub["user_id"],
-                    text=news
-                )
-                logger.info(f"Sent morning news to user {sub['user_id']}")
-            except Exception as e:
-                logger.error(f"Failed to send morning news: {e}")
-    
-    def parse_date(self, date_str: str) -> Optional[str]:
-        """Parse natural language dates"""
-        today = datetime.now().date()
-        date_str = date_str.lower().strip()
-        
-        if date_str == "today":
-            return today.isoformat()
-        elif date_str == "tomorrow":
-            return (today + timedelta(days=1)).isoformat()
-        elif date_str in ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]:
-            days = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
-            target_day = days.index(date_str)
-            current_day = today.weekday()
-            days_ahead = (target_day - current_day) % 7
-            if days_ahead == 0:
-                days_ahead = 7  # Next week
-            return (today + timedelta(days=days_ahead)).isoformat()
-        
-        # Try to parse YYYY-MM-DD format
-        try:
-            datetime.strptime(date_str, "%Y-%m-%d")
-            return date_str
-        except:
-            pass
-        
+    except Exception as e:
+        logger.error(f"Whisper transcription error: {e}")
         return None
-    
-    def run(self):
-        """Start the bot"""
-        logger.info("Starting Diary Bot...")
-        self.application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
-def main():
-    """Main entry point"""
-    # Load environment variables
-    TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-    ANTHROPIC_KEY = os.getenv("ANTHROPIC_API_KEY")
-    OPENAI_KEY = os.getenv("OPENAI_API_KEY")
-    
-    if not TELEGRAM_TOKEN or not ANTHROPIC_KEY or not OPENAI_KEY:
-        print("ERROR: Please set TELEGRAM_BOT_TOKEN, ANTHROPIC_API_KEY, and OPENAI_API_KEY environment variables")
-        print("\nOn Linux/Mac:")
-        print("  export TELEGRAM_BOT_TOKEN='your_token_here'")
-        print("  export ANTHROPIC_API_KEY='your_key_here'")
-        print("  export OPENAI_API_KEY='your_openai_key_here'")
-        print("\nOn Windows:")
-        print("  set TELEGRAM_BOT_TOKEN=your_token_here")
-        print("  set ANTHROPIC_API_KEY=your_key_here")
-        print("  set OPENAI_API_KEY=your_openai_key_here")
+# ── Access control ───────────────────────────────────────────────────────────
+def is_allowed(user_id: int) -> bool:
+    if ALLOWED_USER_ID is None:
+        return True
+    return str(user_id) == str(ALLOWED_USER_ID)
+
+
+# ── Telegram handlers ───────────────────────────────────────────────────────
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update.effective_user.id):
+        await update.message.reply_text("⛔ This bot is private.")
         return
     
-    bot = DiaryBot(TELEGRAM_TOKEN, ANTHROPIC_KEY, OPENAI_KEY)
-    bot.run()
+    user_id = update.effective_user.id
+    user_conversations[str(user_id)] = []  # Reset conversation
+    
+    await update.message.reply_text(
+        "Hey! 👋 I'm Shanti, your personal assistant.\n\n"
+        "Here's what I can do:\n"
+        "• 📅 Schedule things — just tell me your plans naturally\n"
+        "• 📋 Give you daily/weekly summaries — /today or /week\n"
+        "• 🧠 Structure your random thoughts & voice notes\n"
+        "• 🎤 Send me voice messages — I'll transcribe and organize them\n\n"
+        "Commands:\n"
+        "/today — today's schedule\n"
+        "/week — this week's schedule\n"
+        "/clear — clear conversation history\n"
+        "/clearschedule — wipe all schedule data\n\n"
+        "Or just start talking! Tell me what's on your mind. 💬"
+    )
+
+
+async def today_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update.effective_user.id):
+        return
+    text = get_today_schedule_text()
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+
+async def week_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update.effective_user.id):
+        return
+    text = get_week_schedule_text()
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+
+async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update.effective_user.id):
+        return
+    user_id = update.effective_user.id
+    user_conversations[str(user_id)] = []
+    await update.message.reply_text("🧹 Conversation history cleared. Fresh start!")
+
+
+async def clear_schedule_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update.effective_user.id):
+        return
+    save_schedule({})
+    await update.message.reply_text("🗑️ All schedule data cleared.")
+
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update.effective_user.id):
+        return
+    
+    user_id = update.effective_user.id
+    user_text = update.message.text
+    
+    logger.info(f"Text from {user_id}: {user_text[:100]}...")
+    
+    # Send typing indicator
+    await update.message.chat.send_action("typing")
+    
+    response = ask_claude(user_id, user_text)
+    
+    # Split long messages (Telegram limit is 4096 chars)
+    if len(response) > 4000:
+        chunks = [response[i:i+4000] for i in range(0, len(response), 4000)]
+        for chunk in chunks:
+            await update.message.reply_text(chunk)
+    else:
+        await update.message.reply_text(response)
+
+
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update.effective_user.id):
+        return
+    
+    user_id = update.effective_user.id
+    
+    await update.message.reply_text("🎤 Got your voice note, transcribing...")
+    await update.message.chat.send_action("typing")
+    
+    # Download voice file
+    voice = update.message.voice or update.message.audio
+    if not voice:
+        await update.message.reply_text("Hmm, couldn't get the audio. Try again?")
+        return
+    
+    file = await context.bot.get_file(voice.file_id)
+    
+    with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
+        tmp_path = tmp.name
+        await file.download_to_drive(tmp_path)
+    
+    try:
+        transcript = await transcribe_voice(tmp_path)
+        
+        if transcript is None:
+            await update.message.reply_text("⚠️ Couldn't transcribe the audio. Try again or type it out?")
+            return
+        
+        logger.info(f"Voice transcription from {user_id}: {transcript[:100]}...")
+        
+        # Wrap the transcript so Claude knows it's from a voice note
+        voice_message = (
+            f"[VOICE NOTE TRANSCRIPTION]\n"
+            f"{transcript}\n"
+            f"[END VOICE NOTE]\n\n"
+            f"Please structure and respond to this voice note."
+        )
+        
+        await update.message.chat.send_action("typing")
+        response = ask_claude(user_id, voice_message)
+        
+        # Prepend the transcription so user can verify
+        full_response = f"📝 *Transcription:*\n_{transcript}_\n\n---\n\n{response}"
+        
+        if len(full_response) > 4000:
+            # Send transcription first, then response
+            await update.message.reply_text(f"📝 *Transcription:*\n_{transcript}_", parse_mode="Markdown")
+            if len(response) > 4000:
+                chunks = [response[i:i+4000] for i in range(0, len(response), 4000)]
+                for chunk in chunks:
+                    await update.message.reply_text(chunk)
+            else:
+                await update.message.reply_text(response)
+        else:
+            try:
+                await update.message.reply_text(full_response, parse_mode="Markdown")
+            except Exception:
+                # Fallback without markdown if parsing fails
+                await update.message.reply_text(full_response)
+    
+    finally:
+        # Cleanup temp file
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+
+# ── Main ─────────────────────────────────────────────────────────────────────
+def main():
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    
+    # Commands
+    app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("today", today_command))
+    app.add_handler(CommandHandler("week", week_command))
+    app.add_handler(CommandHandler("clear", clear_command))
+    app.add_handler(CommandHandler("clearschedule", clear_schedule_command))
+    
+    # Voice messages
+    app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
+    
+    # Text messages (catch-all, must be last)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    
+    logger.info("Shanti bot is starting...")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
