@@ -281,6 +281,9 @@ Provide helpful, structured advice."""
 class DiaryBot:
     """Main Telegram bot class"""
     
+    # Add __weakref__ slot to support weak references in Python 3.13
+    __slots__ = ('db', 'claude', 'application', '__weakref__')
+    
     def __init__(self, telegram_token: str, anthropic_key: str):
         self.db = DiaryDatabase()
         self.claude = ClaudeAssistant(anthropic_key)
@@ -296,7 +299,8 @@ class DiaryBot:
         
         # Schedule reminder checks
         job_queue = self.application.job_queue
-        job_queue.run_repeating(self.check_reminders, interval=3600, first=10)  # Every hour
+        if job_queue:
+            job_queue.run_repeating(self.check_reminders, interval=3600, first=10)  # Every hour
     
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /start command"""
