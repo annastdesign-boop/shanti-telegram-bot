@@ -4,6 +4,7 @@ import logging
 import tempfile
 from datetime import datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import openai
 from anthropic import Anthropic
@@ -16,6 +17,8 @@ from telegram.ext import (
     filters,
     ContextTypes,
 )
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -32,6 +35,7 @@ TAVILY_API_KEY = os.environ["TAVILY_API_KEY"]
 
 # Optional: restrict bot to your user ID only
 ALLOWED_USER_ID = os.environ.get("ALLOWED_USER_ID")
+USER_TIMEZONE = os.environ.get("USER_TIMEZONE", "UTC")  # e.g., "Europe/Berlin"
 
 # ── Clients ──────────────────────────────────────────────────────────────────
 anthropic_client = Anthropic(api_key=ANTHROPIC_API_KEY)
@@ -43,6 +47,7 @@ DATA_DIR = Path("data")
 DATA_DIR.mkdir(exist_ok=True)
 SCHEDULE_FILE = DATA_DIR / "schedule.json"
 PRICE_WATCHES_FILE = DATA_DIR / "price_watches.json"
+REMINDERS_FILE = DATA_DIR / "reminders.json"
 
 
 def load_json(path: Path, default=None):
@@ -76,6 +81,161 @@ def append_message(user_id: int, role: str, content: str):
     history.append({"role": role, "content": content})
     if len(history) > MAX_HISTORY:
         user_conversations[str(user_id)] = history[-MAX_HISTORY:]
+
+
+# ── Reminder system ──────────────────────────────────────────────────────────
+class ReminderManager:
+    def __init__(self, app: Application):
+        self.app = app
+        self.scheduler = BackgroundScheduler()
+        self.reminders_data = {}
+        self.load_reminders()
+
+    def load_reminders(self):
+        self.reminders_data = load_json(REMINDERS_FILE, {})
+
+    def save_reminders(self):
+        save_json(REMINDERS_FILE, self.reminders_data)
+
+    def add_reminder(self, user_id: int, task: str, date: str, time: str, notes: str = ""):
+        """Add a reminder and schedule it."""
+        reminder_id = f"{user_id}_{len(self.reminders_data)}"
+        
+        self.reminders_data[reminder_id] = {
+            "user_id": user_id,
+            "task": task,
+            "date": date,
+            "time": time,
+            "notes": notes,
+            "created": datetime.now().isoformat(),
+            "sent": False,
+        }
+        self.save_reminders()
+        
+        # Schedule the reminder
+        self.schedule_reminder(reminder_id)
+        logger.info(f"Added reminder: {task} on {date} at {time}")
+
+    def schedule_reminder(self, reminder_id: str):
+        """Schedule a reminder to be sent at the specified time."""
+        if reminder_id not in self.reminders_data:
+            return
+
+        reminder = self.reminders_data[reminder_id]
+        user_id = reminder["user_id"]
+        date_str = reminder["date"]  # YYYY-MM-DD
+        time_str = reminder["time"]  # HH:MM
+
+        try:
+            # Parse the date and time
+            datetime_obj = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M")
+            
+            # Make it timezone-aware
+            tz = ZoneInfo(USER_TIMEZONE)
+            datetime_obj = datetime_obj.replace(tzinfo=tz)
+
+            # Add job to scheduler
+            self.scheduler.add_job(
+                self.send_reminder,
+                trigger=CronTrigger(
+                    year=datetime_obj.year,
+                    month=datetime_obj.month,
+                    day=datetime_obj.day,
+                    hour=datetime_obj.hour,
+                    minute=datetime_obj.minute,
+                    timezone=USER_TIMEZONE,
+                ),
+                args=[reminder_id],
+                id=reminder_id,
+                replace_existing=True,
+            )
+            logger.info(f"Scheduled reminder {reminder_id} for {datetime_obj}")
+        except Exception as e:
+            logger.error(f"Failed to schedule reminder {reminder_id}: {e}")
+
+    async def send_reminder(self, reminder_id: str):
+        """Send a reminder message to the user."""
+        if reminder_id not in self.reminders_data:
+            return
+
+        reminder = self.reminders_data[reminder_id]
+        user_id = reminder["user_id"]
+        task = reminder["task"]
+        notes = reminder.get("notes", "")
+
+        message = f"⏰ **Reminder:** {task}"
+        if notes:
+            message += f"\n📝 {notes}"
+
+        try:
+            await self.app.bot.send_message(
+                chat_id=user_id,
+                text=message,
+                parse_mode="Markdown",
+            )
+            logger.info(f"Sent reminder to {user_id}: {task}")
+
+            # Mark as sent
+            self.reminders_data[reminder_id]["sent"] = True
+            self.save_reminders()
+        except Exception as e:
+            logger.error(f"Failed to send reminder to {user_id}: {e}")
+
+    def get_upcoming_reminders(self, user_id: int) -> str:
+        """Get list of upcoming reminders for a user."""
+        upcoming = []
+        for reminder_id, reminder in self.reminders_data.items():
+            if reminder["user_id"] == user_id and not reminder["sent"]:
+                upcoming.append(reminder)
+
+        if not upcoming:
+            return "No upcoming reminders."
+
+        # Sort by date and time
+        upcoming.sort(key=lambda x: (x["date"], x["time"]))
+
+        lines = ["📬 **Your Upcoming Reminders:**"]
+        for i, r in enumerate(upcoming, 1):
+            lines.append(f"{i}. [{r['date']} {r['time']}] {r['task']}")
+            if r.get("notes"):
+                lines.append(f"   📝 {r['notes']}")
+
+        return "\n".join(lines)
+
+    def remove_reminder(self, user_id: int, task_keyword: str) -> bool:
+        """Remove a reminder by task keyword."""
+        removed = False
+        for reminder_id, reminder in list(self.reminders_data.items()):
+            if (reminder["user_id"] == user_id and 
+                task_keyword.lower() in reminder["task"].lower()):
+                del self.reminders_data[reminder_id]
+                # Remove from scheduler
+                try:
+                    self.scheduler.remove_job(reminder_id)
+                except:
+                    pass
+                removed = True
+                logger.info(f"Removed reminder: {reminder['task']}")
+
+        if removed:
+            self.save_reminders()
+        return removed
+
+    def start(self):
+        """Start the scheduler and reschedule all reminders."""
+        if not self.scheduler.running:
+            self.scheduler.start()
+            logger.info("Reminder scheduler started")
+            
+            # Reschedule all non-sent reminders
+            for reminder_id in self.reminders_data:
+                reminder = self.reminders_data[reminder_id]
+                if not reminder["sent"]:
+                    self.schedule_reminder(reminder_id)
+
+
+# Global reminder manager (will be initialized in main)
+reminder_manager = None
 
 
 # ── Schedule helpers ─────────────────────────────────────────────────────────
@@ -255,6 +415,7 @@ def decide_if_search_needed(user_message: str) -> dict:
 # ── System prompt ────────────────────────────────────────────────────────────
 def build_system_prompt(user_id: int, search_context: str = "") -> str:
     today_schedule = get_today_schedule_text()
+    upcoming_reminders = reminder_manager.get_upcoming_reminders(user_id) if reminder_manager else ""
     today = datetime.now().strftime("%A, %B %d, %Y")
     current_time = datetime.now().strftime("%H:%M")
     price_watches = get_price_watches_text()
@@ -268,10 +429,18 @@ def build_system_prompt(user_id: int, search_context: str = "") -> str:
 IMPORTANT: Use these search results to answer the user's question. Cite specific prices, links, and dates from the results. If the results are not relevant enough, say so and suggest a better search query.
 """
 
+    reminders_section = ""
+    if upcoming_reminders and "No upcoming" not in upcoming_reminders:
+        reminders_section = f"""
+── UPCOMING REMINDERS ──
+{upcoming_reminders}
+"""
+
     return f"""You are Shanti — a warm, intelligent personal assistant. You are NOT a generic chatbot. You are deeply personal, context-aware, and proactive.
 
 Current date: {today}
 Current time: {current_time}
+Timezone: {USER_TIMEZONE}
 
 ── YOUR CORE CAPABILITIES ──
 
@@ -283,29 +452,38 @@ Current time: {current_time}
      ```
    - If time is vague ("morning"), estimate. If date is vague ("tomorrow"), calculate from today.
 
-2. **DAILY SUMMARY**
+2. **REMINDERS** ⭐ NEW
+   - When user says "remind me" or "send me a reminder", use:
+     ```REMINDER_ADD
+     {{"date": "YYYY-MM-DD", "time": "HH:MM", "task": "what to remind about", "notes": "optional"}}
+     ```
+   - Reminders automatically trigger notifications at the scheduled time.
+   - User can also ask "show reminders" or "/reminders" to see what's set.
+   - Format: YYYY-MM-DD for date, HH:MM for time in 24-hour format.
+
+3. **DAILY SUMMARY**
    - When asked for summary/plan — provide schedule in clean format with advice.
 
-3. **THOUGHT STRUCTURING**
+4. **THOUGHT STRUCTURING**
    - When user dumps random thoughts/brain dumps — STRUCTURE into: key themes, action items, ideas to revisit, emotional check-in if relevant.
 
-4. **VOICE NOTES**
+5. **VOICE NOTES**
    - Voice messages are transcribed. They may be messy. Treat as brain dumps unless clearly specific requests.
    - Always acknowledge and structure the content.
 
-5. **WEB SEARCH & LIVE INFO**
+6. **WEB SEARCH & LIVE INFO**
    - You now have access to live web search results when relevant.
    - When search results are provided below, USE THEM to give specific, helpful answers.
    - Include specific prices, dates, links from the results.
    - Be honest about what the search found vs. what you're estimating.
 
-6. **PRICE WATCHING**
+7. **PRICE WATCHING**
    - If the user wants you to track a price (flights, events, etc.), output:
      ```PRICE_WATCH
      {{"description": "what to track", "search_query": "search query to use", "frequency": "daily|weekly"}}
      ```
 
-7. **REMOVING/EDITING SCHEDULE**
+8. **REMOVING/EDITING SCHEDULE**
    - Remove:
      ```SCHEDULE_REMOVE
      {{"date": "YYYY-MM-DD", "task_keyword": "keyword to match"}}
@@ -315,12 +493,21 @@ Current time: {current_time}
      {{"date": "YYYY-MM-DD", "task_keyword": "old keyword", "new_time": "HH:MM", "new_task": "new description"}}
      ```
 
+9. **REMOVING REMINDERS**
+   - Remove a reminder:
+     ```REMINDER_REMOVE
+     {{"task_keyword": "keyword to match"}}
+     ```
+
 ── TODAY'S SCHEDULE ──
 {today_schedule}
+
+{reminders_section}
 
 ── PRICE WATCHES ──
 {price_watches}
 {search_section}
+
 ── PERSONALITY ──
 - Warm, supportive, slightly witty
 - Remember conversation context
@@ -336,7 +523,8 @@ Current time: {current_time}
 - NEVER say you can't search the web — you CAN via live search
 - NEVER give generic responses — reference actual context
 - If you detect scheduling intent, ALWAYS include SCHEDULE_ADD block
-- Schedule/price blocks must be valid JSON
+- If you detect reminder intent, ALWAYS include REMINDER_ADD block
+- Schedule/reminder/price blocks must be valid JSON
 - Today is {today}. Calculate dates correctly.
 """
 
@@ -382,8 +570,9 @@ def ask_claude(user_id: int, user_message: str) -> str:
         # Save assistant response to history
         append_message(user_id, "assistant", assistant_text)
 
-        # Process schedule and price watch commands
+        # Process commands
         process_schedule_commands(assistant_text)
+        process_reminder_commands(assistant_text)
         process_price_watch_commands(assistant_text)
 
         # Clean response
@@ -462,6 +651,69 @@ def process_schedule_commands(text: str):
         save_schedule(schedule)
 
 
+def process_reminder_commands(text: str):
+    """Process REMINDER_ADD and REMINDER_REMOVE commands."""
+    if "```REMINDER_ADD" in text:
+        try:
+            block = text.split("```REMINDER_ADD")[1].split("```")[0].strip()
+            data = json.loads(block)
+            
+            date = data.get("date")
+            time = data.get("time")
+            task = data.get("task")
+            notes = data.get("notes", "")
+            
+            # Extract user_id from context — you'll need to pass this
+            # For now, we'll need to modify this function signature
+            if date and time and task:
+                logger.info(f"Reminder command parsed: {task} on {date} at {time}")
+                # Will be processed in handle_text with user_id
+        except (json.JSONDecodeError, KeyError, IndexError) as e:
+            logger.error(f"Failed to parse REMINDER_ADD: {e}")
+
+    if "```REMINDER_REMOVE" in text:
+        try:
+            block = text.split("```REMINDER_REMOVE")[1].split("```")[0].strip()
+            data = json.loads(block)
+            keyword = data.get("task_keyword", "")
+            logger.info(f"Reminder remove command parsed: {keyword}")
+        except (json.JSONDecodeError, KeyError, IndexError) as e:
+            logger.error(f"Failed to parse REMINDER_REMOVE: {e}")
+
+
+def process_reminder_commands_with_user(text: str, user_id: int):
+    """Process REMINDER_ADD and REMINDER_REMOVE commands with user_id."""
+    if reminder_manager is None:
+        return
+
+    if "```REMINDER_ADD" in text:
+        try:
+            block = text.split("```REMINDER_ADD")[1].split("```")[0].strip()
+            data = json.loads(block)
+            
+            date = data.get("date")
+            time = data.get("time")
+            task = data.get("task")
+            notes = data.get("notes", "")
+            
+            if date and time and task:
+                reminder_manager.add_reminder(user_id, task, date, time, notes)
+                logger.info(f"Added reminder for user {user_id}: {task} on {date} at {time}")
+        except (json.JSONDecodeError, KeyError, IndexError) as e:
+            logger.error(f"Failed to parse REMINDER_ADD: {e}")
+
+    if "```REMINDER_REMOVE" in text:
+        try:
+            block = text.split("```REMINDER_REMOVE")[1].split("```")[0].strip()
+            data = json.loads(block)
+            keyword = data.get("task_keyword", "")
+            
+            if keyword and reminder_manager.remove_reminder(user_id, keyword):
+                logger.info(f"Removed reminder for user {user_id}: {keyword}")
+        except (json.JSONDecodeError, KeyError, IndexError) as e:
+            logger.error(f"Failed to parse REMINDER_REMOVE: {e}")
+
+
 def process_price_watch_commands(text: str):
     if "```PRICE_WATCH" not in text:
         return
@@ -485,7 +737,7 @@ def process_price_watch_commands(text: str):
 
 def clean_response(text: str) -> str:
     clean = text
-    for tag in ["SCHEDULE_ADD", "SCHEDULE_REMOVE", "SCHEDULE_EDIT", "PRICE_WATCH"]:
+    for tag in ["SCHEDULE_ADD", "SCHEDULE_REMOVE", "SCHEDULE_EDIT", "REMINDER_ADD", "REMINDER_REMOVE", "PRICE_WATCH"]:
         while f"```{tag}" in clean:
             try:
                 before = clean.split(f"```{tag}")[0]
@@ -534,6 +786,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Hey! 👋 I'm Shanti, your personal assistant.\n\n"
         "Here's what I can do:\n"
         "• 📅 Schedule things — just tell me your plans naturally\n"
+        "• ⏰ Set reminders — \"remind me to buy groceries on Tuesday at 10am\"\n"
         "• 📋 Daily/weekly summaries — /today or /week\n"
         "• 🧠 Structure your random thoughts & voice notes\n"
         "• 🎤 Send voice messages — I'll transcribe and organize\n"
@@ -542,11 +795,13 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Commands:\n"
         "/today — today's schedule\n"
         "/week — this week's schedule\n"
+        "/reminders — show all upcoming reminders\n"
         "/search <query> — force a web search\n"
         "/watches — see active price watches\n"
         "/checkprices — manually check all watched prices\n"
         "/clear — clear conversation history\n"
-        "/clearschedule — wipe all schedule data\n\n"
+        "/clearschedule — wipe all schedule data\n"
+        "/clearreminders — wipe all reminders\n\n"
         "Or just start talking! 💬"
     )
 
@@ -565,6 +820,19 @@ async def week_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode="Markdown")
 
 
+async def reminders_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update.effective_user.id):
+        return
+    
+    user_id = update.effective_user.id
+    if reminder_manager:
+        text = reminder_manager.get_upcoming_reminders(user_id)
+    else:
+        text = "Reminder system not initialized."
+    
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+
 async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update.effective_user.id):
         return
@@ -578,6 +846,18 @@ async def clear_schedule_command(update: Update, context: ContextTypes.DEFAULT_T
         return
     save_schedule({})
     await update.message.reply_text("🗑️ All schedule data cleared.")
+
+
+async def clear_reminders_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update.effective_user.id):
+        return
+    
+    if reminder_manager:
+        reminder_manager.reminders_data = {}
+        reminder_manager.save_reminders()
+        await update.message.reply_text("🗑️ All reminders cleared.")
+    else:
+        await update.message.reply_text("Reminder system not initialized.")
 
 
 async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -667,6 +947,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.chat.send_action("typing")
 
     response = ask_claude(user_id, user_text)
+    
+    # Process reminder commands with user_id
+    process_reminder_commands_with_user(response, user_id)
 
     if len(response) > 4000:
         chunks = [response[i:i + 4000] for i in range(0, len(response), 4000)]
@@ -714,6 +997,9 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await update.message.chat.send_action("typing")
         response = ask_claude(user_id, voice_message)
+        
+        # Process reminder commands with user_id
+        process_reminder_commands_with_user(response, user_id)
 
         full_response = f"📝 *Transcription:*\n_{transcript}_\n\n---\n\n{response}"
 
@@ -742,15 +1028,28 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
+async def post_init(app: Application):
+    """Called after bot is initialized."""
+    global reminder_manager
+    reminder_manager = ReminderManager(app)
+    reminder_manager.start()
+    logger.info("Reminder manager initialized and started")
+
+
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
+
+    # Initialize reminder manager after bot starts
+    app.post_init = post_init
 
     # Commands
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("today", today_command))
     app.add_handler(CommandHandler("week", week_command))
+    app.add_handler(CommandHandler("reminders", reminders_command))
     app.add_handler(CommandHandler("clear", clear_command))
     app.add_handler(CommandHandler("clearschedule", clear_schedule_command))
+    app.add_handler(CommandHandler("clearreminders", clear_reminders_command))
     app.add_handler(CommandHandler("search", search_command))
     app.add_handler(CommandHandler("watches", watches_command))
     app.add_handler(CommandHandler("checkprices", check_prices_command))
