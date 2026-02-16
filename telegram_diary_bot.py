@@ -2,7 +2,7 @@ import os
 import json
 import logging
 import tempfile
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -16,9 +16,8 @@ from telegram.ext import (
     MessageHandler,
     filters,
     ContextTypes,
+    CallbackContext,
 )
-from apscheduler.schedulers.background import BackgroundScheduler
-from apscheduler.triggers.cron import CronTrigger
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -33,9 +32,11 @@ ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 TAVILY_API_KEY = os.environ["TAVILY_API_KEY"]
 
-# Optional: restrict bot to your user ID only
 ALLOWED_USER_ID = os.environ.get("ALLOWED_USER_ID")
-USER_TIMEZONE = os.environ.get("USER_TIMEZONE", "UTC")  # e.g., "Europe/Berlin"
+
+# Set your timezone here — change to yours
+USER_TIMEZONE = os.environ.get("USER_TIMEZONE", "Europe/Berlin")
+TZ = ZoneInfo(USER_TIMEZONE)
 
 # ── Clients ──────────────────────────────────────────────────────────────────
 anthropic_client = Anthropic(api_key=ANTHROPIC_API_KEY)
@@ -48,6 +49,7 @@ DATA_DIR.mkdir(exist_ok=True)
 SCHEDULE_FILE = DATA_DIR / "schedule.json"
 PRICE_WATCHES_FILE = DATA_DIR / "price_watches.json"
 REMINDERS_FILE = DATA_DIR / "reminders.json"
+CHAT_IDS_FILE = DATA_DIR / "chat_ids.json"
 
 
 def load_json(path: Path, default=None):
@@ -62,6 +64,18 @@ def load_json(path: Path, default=None):
 def save_json(path: Path, data):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+# ── Chat ID tracking (maps user_id -> chat_id) ──────────────────────────────
+def save_chat_id(user_id: int, chat_id: int):
+    data = load_json(CHAT_IDS_FILE, {})
+    data[str(user_id)] = chat_id
+    save_json(CHAT_IDS_FILE, data)
+
+
+def get_chat_id(user_id: int) -> int | None:
+    data = load_json(CHAT_IDS_FILE, {})
+    return data.get(str(user_id))
 
 
 # ── Per-user conversation history ────────────────────────────────────────────
@@ -83,161 +97,6 @@ def append_message(user_id: int, role: str, content: str):
         user_conversations[str(user_id)] = history[-MAX_HISTORY:]
 
 
-# ── Reminder system ──────────────────────────────────────────────────────────
-class ReminderManager:
-    def __init__(self, app: Application):
-        self.app = app
-        self.scheduler = BackgroundScheduler()
-        self.reminders_data = {}
-        self.load_reminders()
-
-    def load_reminders(self):
-        self.reminders_data = load_json(REMINDERS_FILE, {})
-
-    def save_reminders(self):
-        save_json(REMINDERS_FILE, self.reminders_data)
-
-    def add_reminder(self, user_id: int, task: str, date: str, time: str, notes: str = ""):
-        """Add a reminder and schedule it."""
-        reminder_id = f"{user_id}_{len(self.reminders_data)}"
-        
-        self.reminders_data[reminder_id] = {
-            "user_id": user_id,
-            "task": task,
-            "date": date,
-            "time": time,
-            "notes": notes,
-            "created": datetime.now().isoformat(),
-            "sent": False,
-        }
-        self.save_reminders()
-        
-        # Schedule the reminder
-        self.schedule_reminder(reminder_id)
-        logger.info(f"Added reminder: {task} on {date} at {time}")
-
-    def schedule_reminder(self, reminder_id: str):
-        """Schedule a reminder to be sent at the specified time."""
-        if reminder_id not in self.reminders_data:
-            return
-
-        reminder = self.reminders_data[reminder_id]
-        user_id = reminder["user_id"]
-        date_str = reminder["date"]  # YYYY-MM-DD
-        time_str = reminder["time"]  # HH:MM
-
-        try:
-            # Parse the date and time
-            datetime_obj = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M")
-            
-            # Make it timezone-aware
-            tz = ZoneInfo(USER_TIMEZONE)
-            datetime_obj = datetime_obj.replace(tzinfo=tz)
-
-            # Add job to scheduler
-            self.scheduler.add_job(
-                self.send_reminder,
-                trigger=CronTrigger(
-                    year=datetime_obj.year,
-                    month=datetime_obj.month,
-                    day=datetime_obj.day,
-                    hour=datetime_obj.hour,
-                    minute=datetime_obj.minute,
-                    timezone=USER_TIMEZONE,
-                ),
-                args=[reminder_id],
-                id=reminder_id,
-                replace_existing=True,
-            )
-            logger.info(f"Scheduled reminder {reminder_id} for {datetime_obj}")
-        except Exception as e:
-            logger.error(f"Failed to schedule reminder {reminder_id}: {e}")
-
-    async def send_reminder(self, reminder_id: str):
-        """Send a reminder message to the user."""
-        if reminder_id not in self.reminders_data:
-            return
-
-        reminder = self.reminders_data[reminder_id]
-        user_id = reminder["user_id"]
-        task = reminder["task"]
-        notes = reminder.get("notes", "")
-
-        message = f"⏰ **Reminder:** {task}"
-        if notes:
-            message += f"\n📝 {notes}"
-
-        try:
-            await self.app.bot.send_message(
-                chat_id=user_id,
-                text=message,
-                parse_mode="Markdown",
-            )
-            logger.info(f"Sent reminder to {user_id}: {task}")
-
-            # Mark as sent
-            self.reminders_data[reminder_id]["sent"] = True
-            self.save_reminders()
-        except Exception as e:
-            logger.error(f"Failed to send reminder to {user_id}: {e}")
-
-    def get_upcoming_reminders(self, user_id: int) -> str:
-        """Get list of upcoming reminders for a user."""
-        upcoming = []
-        for reminder_id, reminder in self.reminders_data.items():
-            if reminder["user_id"] == user_id and not reminder["sent"]:
-                upcoming.append(reminder)
-
-        if not upcoming:
-            return "No upcoming reminders."
-
-        # Sort by date and time
-        upcoming.sort(key=lambda x: (x["date"], x["time"]))
-
-        lines = ["📬 **Your Upcoming Reminders:**"]
-        for i, r in enumerate(upcoming, 1):
-            lines.append(f"{i}. [{r['date']} {r['time']}] {r['task']}")
-            if r.get("notes"):
-                lines.append(f"   📝 {r['notes']}")
-
-        return "\n".join(lines)
-
-    def remove_reminder(self, user_id: int, task_keyword: str) -> bool:
-        """Remove a reminder by task keyword."""
-        removed = False
-        for reminder_id, reminder in list(self.reminders_data.items()):
-            if (reminder["user_id"] == user_id and 
-                task_keyword.lower() in reminder["task"].lower()):
-                del self.reminders_data[reminder_id]
-                # Remove from scheduler
-                try:
-                    self.scheduler.remove_job(reminder_id)
-                except:
-                    pass
-                removed = True
-                logger.info(f"Removed reminder: {reminder['task']}")
-
-        if removed:
-            self.save_reminders()
-        return removed
-
-    def start(self):
-        """Start the scheduler and reschedule all reminders."""
-        if not self.scheduler.running:
-            self.scheduler.start()
-            logger.info("Reminder scheduler started")
-            
-            # Reschedule all non-sent reminders
-            for reminder_id in self.reminders_data:
-                reminder = self.reminders_data[reminder_id]
-                if not reminder["sent"]:
-                    self.schedule_reminder(reminder_id)
-
-
-# Global reminder manager (will be initialized in main)
-reminder_manager = None
-
-
 # ── Schedule helpers ─────────────────────────────────────────────────────────
 def load_schedule() -> dict:
     return load_json(SCHEDULE_FILE, {})
@@ -248,7 +107,11 @@ def save_schedule(schedule: dict):
 
 
 def get_today_key() -> str:
-    return datetime.now().strftime("%Y-%m-%d")
+    return datetime.now(TZ).strftime("%Y-%m-%d")
+
+
+def get_now() -> datetime:
+    return datetime.now(TZ)
 
 
 def get_today_schedule_text() -> str:
@@ -257,7 +120,7 @@ def get_today_schedule_text() -> str:
     items = schedule.get(today, [])
     if not items:
         return f"No plans scheduled for today ({today})."
-    lines = [f"📅 **Schedule for {today}:**"]
+    lines = [f"📅 Schedule for {today}:"]
     for i, item in enumerate(items, 1):
         time_str = item.get("time", "no specific time")
         task = item.get("task", "")
@@ -271,8 +134,8 @@ def get_today_schedule_text() -> str:
 
 def get_week_schedule_text() -> str:
     schedule = load_schedule()
-    today = datetime.now()
-    lines = ["📅 **This week's schedule:**"]
+    today = get_now()
+    lines = ["📅 This week's schedule:"]
     found_anything = False
     for delta in range(7):
         day = today + timedelta(days=delta)
@@ -281,7 +144,7 @@ def get_week_schedule_text() -> str:
         items = schedule.get(key, [])
         if items:
             found_anything = True
-            lines.append(f"\n**{day_name}:**")
+            lines.append(f"\n{day_name}:")
             for i, item in enumerate(items, 1):
                 time_str = item.get("time", "")
                 task = item.get("task", "")
@@ -289,6 +152,28 @@ def get_week_schedule_text() -> str:
                 lines.append(line)
     if not found_anything:
         lines.append("Nothing scheduled for the next 7 days.")
+    return "\n".join(lines)
+
+
+# ── Reminder helpers ─────────────────────────────────────────────────────────
+def load_reminders() -> list:
+    return load_json(REMINDERS_FILE, [])
+
+
+def save_reminders(reminders: list):
+    save_json(REMINDERS_FILE, reminders)
+
+
+def get_reminders_text() -> str:
+    reminders = load_reminders()
+    active = [r for r in reminders if not r.get("sent", False)]
+    if not active:
+        return "No active reminders."
+    lines = ["⏰ Active Reminders:"]
+    for i, r in enumerate(active, 1):
+        dt = r.get("datetime", "unknown time")
+        msg = r.get("message", "")
+        lines.append(f"{i}. [{dt}] {msg}")
     return "\n".join(lines)
 
 
@@ -305,7 +190,7 @@ def get_price_watches_text() -> str:
     watches = load_price_watches()
     if not watches:
         return "No active price watches."
-    lines = ["👀 **Active Price Watches:**"]
+    lines = ["👀 Active Price Watches:"]
     for i, w in enumerate(watches, 1):
         lines.append(f"{i}. {w.get('description', 'unknown')} — last checked: {w.get('last_checked', 'never')}")
     return "\n".join(lines)
@@ -313,7 +198,6 @@ def get_price_watches_text() -> str:
 
 # ── Tavily web search ────────────────────────────────────────────────────────
 def web_search(query: str, search_depth: str = "advanced", max_results: int = 5) -> str:
-    """Perform a web search using Tavily and return formatted results."""
     try:
         logger.info(f"Tavily search: {query}")
         response = tavily_client.search(
@@ -322,44 +206,25 @@ def web_search(query: str, search_depth: str = "advanced", max_results: int = 5)
             max_results=max_results,
             include_answer=True,
         )
-
         results_text = ""
-
-        # Tavily's AI-generated answer
         if response.get("answer"):
-            results_text += f"**AI Summary:** {response['answer']}\n\n"
-
-        results_text += "**Sources:**\n"
+            results_text += f"AI Summary: {response['answer']}\n\n"
+        results_text += "Sources:\n"
         for i, result in enumerate(response.get("results", []), 1):
             title = result.get("title", "No title")
             url = result.get("url", "")
             content = result.get("content", "")
-            # Truncate long content
             if len(content) > 300:
                 content = content[:300] + "..."
-            results_text += f"{i}. **{title}**\n   {url}\n   {content}\n\n"
-
+            results_text += f"{i}. {title}\n   {url}\n   {content}\n\n"
         return results_text
-
     except Exception as e:
         logger.error(f"Tavily search error: {e}")
         return f"Search failed: {str(e)[:200]}"
 
 
-def search_flights(origin: str, destination: str, date: str) -> str:
-    """Search for flight prices."""
-    query = f"cheapest flights from {origin} to {destination} {date} prices booking"
-    return web_search(query, search_depth="advanced", max_results=5)
-
-
-def search_events(location: str, date_range: str = "") -> str:
-    """Search for events in a location."""
-    query = f"events in {location} {date_range} concerts festivals things to do"
-    return web_search(query, search_depth="advanced", max_results=5)
-
-
-# ── Two-step Claude: decide if search needed, then respond ───────────────────
-SEARCH_DECISION_PROMPT = """You are a routing assistant. Your ONLY job is to decide if the user's message needs a live web search.
+# ── Search decision ──────────────────────────────────────────────────────────
+SEARCH_DECISION_PROMPT = """You are a routing assistant. Decide if the user's message needs a live web search.
 
 Reply with EXACTLY one JSON object, nothing else.
 
@@ -369,29 +234,12 @@ If search IS needed:
 If search is NOT needed:
 {"needs_search": false}
 
-Examples of messages that NEED search:
-- "Find me flights from Berlin to Tokyo in March"
-- "What events are happening in Barcelona this weekend?"
-- "How much are tickets to Burning Man?"
-- "Check the price of flights to Lisbon"
-- "What concerts are in NYC next month?"
-- "Search for cheap hotels in Amsterdam"
-- "What's the weather in Paris?"
-- "Latest news about tech layoffs"
-- "Find restaurants near me in Kreuzberg"
+Messages that NEED search: flight prices, event listings, hotel prices, news, weather, restaurant recommendations, anything requiring current real-world data.
 
-Examples that do NOT need search:
-- "Schedule a meeting tomorrow at 3pm"
-- "What do I have planned today?"
-- "I'm feeling stressed about work"
-- "Remind me to buy groceries"
-- "Organize my thoughts about the project"
-- General conversation, scheduling, thought structuring
-"""
+Messages that do NOT need search: scheduling, reminders, thought structuring, personal conversation, summarizing plans, anything about the user's own data."""
 
 
 def decide_if_search_needed(user_message: str) -> dict:
-    """Ask Claude to decide if web search is needed."""
     try:
         response = anthropic_client.messages.create(
             model="claude-sonnet-4-20250514",
@@ -400,13 +248,10 @@ def decide_if_search_needed(user_message: str) -> dict:
             messages=[{"role": "user", "content": user_message}],
         )
         text = response.content[0].text.strip()
-
-        # Try to extract JSON from response
         if "{" in text:
             json_str = text[text.index("{"):text.rindex("}") + 1]
             return json.loads(json_str)
         return {"needs_search": False}
-
     except Exception as e:
         logger.error(f"Search decision error: {e}")
         return {"needs_search": False}
@@ -415,9 +260,9 @@ def decide_if_search_needed(user_message: str) -> dict:
 # ── System prompt ────────────────────────────────────────────────────────────
 def build_system_prompt(user_id: int, search_context: str = "") -> str:
     today_schedule = get_today_schedule_text()
-    upcoming_reminders = reminder_manager.get_upcoming_reminders(user_id) if reminder_manager else ""
-    today = datetime.now().strftime("%A, %B %d, %Y")
-    current_time = datetime.now().strftime("%H:%M")
+    today = get_now().strftime("%A, %B %d, %Y")
+    current_time = get_now().strftime("%H:%M")
+    reminders_text = get_reminders_text()
     price_watches = get_price_watches_text()
 
     search_section = ""
@@ -426,17 +271,10 @@ def build_system_prompt(user_id: int, search_context: str = "") -> str:
 ── LIVE SEARCH RESULTS (just fetched from the web) ──
 {search_context}
 
-IMPORTANT: Use these search results to answer the user's question. Cite specific prices, links, and dates from the results. If the results are not relevant enough, say so and suggest a better search query.
+IMPORTANT: Use these search results to answer the user's question. Cite specific prices, links, and dates. If results aren't relevant enough, say so.
 """
 
-    reminders_section = ""
-    if upcoming_reminders and "No upcoming" not in upcoming_reminders:
-        reminders_section = f"""
-── UPCOMING REMINDERS ──
-{upcoming_reminders}
-"""
-
-    return f"""You are Shanti — a warm, intelligent personal assistant. You are NOT a generic chatbot. You are deeply personal, context-aware, and proactive.
+    return f"""You are Shanti — a warm, intelligent personal assistant. You are deeply personal, context-aware, and proactive.
 
 Current date: {today}
 Current time: {current_time}
@@ -445,116 +283,106 @@ Timezone: {USER_TIMEZONE}
 ── YOUR CORE CAPABILITIES ──
 
 1. **SCHEDULING & PLANNING**
-   - When the user mentions plans, appointments, tasks, or anything time-related, EXTRACT the structured data.
-   - Format for adding schedule items (put at END of your message):
+   - When the user mentions plans/appointments/tasks, EXTRACT structured data.
+   - Put at END of your message:
      ```SCHEDULE_ADD
      {{"date": "YYYY-MM-DD", "time": "HH:MM", "task": "description", "notes": "optional"}}
      ```
-   - If time is vague ("morning"), estimate. If date is vague ("tomorrow"), calculate from today.
+   - Calculate dates from today: "tomorrow" = {(get_now() + timedelta(days=1)).strftime("%Y-%m-%d")}, etc.
 
-2. **REMINDERS** ⭐ NEW
-   - When user says "remind me" or "send me a reminder", use:
+2. **REMINDERS (PUSH NOTIFICATIONS)**
+   - When the user says "remind me", "send me a reminder", "notify me", "alert me" — create a reminder.
+   - Put at END of your message:
      ```REMINDER_ADD
-     {{"date": "YYYY-MM-DD", "time": "HH:MM", "task": "what to remind about", "notes": "optional"}}
+     {{"datetime": "YYYY-MM-DD HH:MM", "message": "what to remind about"}}
      ```
-   - Reminders automatically trigger notifications at the scheduled time.
-   - User can also ask "show reminders" or "/reminders" to see what's set.
-   - Format: YYYY-MM-DD for date, HH:MM for time in 24-hour format.
+   - Calculate the datetime properly. Examples:
+     - "remind me in 30 minutes" → {(get_now() + timedelta(minutes=30)).strftime("%Y-%m-%d %H:%M")}
+     - "remind me tomorrow at 9am" → {(get_now() + timedelta(days=1)).strftime("%Y-%m-%d")} 09:00
+     - "remind me in 2 hours" → {(get_now() + timedelta(hours=2)).strftime("%Y-%m-%d %H:%M")}
+   - ALWAYS include the REMINDER_ADD block when the user wants to be reminded.
+   - The reminder will be sent as a Telegram notification at that exact time.
 
 3. **DAILY SUMMARY**
-   - When asked for summary/plan — provide schedule in clean format with advice.
+   - When asked for summary — provide schedule + active reminders cleanly.
 
 4. **THOUGHT STRUCTURING**
-   - When user dumps random thoughts/brain dumps — STRUCTURE into: key themes, action items, ideas to revisit, emotional check-in if relevant.
+   - Brain dumps → organize into: key themes, action items, ideas to revisit, emotional check-in.
 
 5. **VOICE NOTES**
-   - Voice messages are transcribed. They may be messy. Treat as brain dumps unless clearly specific requests.
-   - Always acknowledge and structure the content.
+   - Transcribed voice → treat as brain dumps unless specific requests. Structure the content.
 
 6. **WEB SEARCH & LIVE INFO**
-   - You now have access to live web search results when relevant.
-   - When search results are provided below, USE THEM to give specific, helpful answers.
-   - Include specific prices, dates, links from the results.
-   - Be honest about what the search found vs. what you're estimating.
+   - You have live web search. When results are provided, USE them with specific prices/dates/links.
+   - NEVER say you can't search the web.
 
 7. **PRICE WATCHING**
-   - If the user wants you to track a price (flights, events, etc.), output:
+   - Track prices:
      ```PRICE_WATCH
-     {{"description": "what to track", "search_query": "search query to use", "frequency": "daily|weekly"}}
+     {{"description": "what to track", "search_query": "search query", "frequency": "daily|weekly"}}
      ```
 
-8. **REMOVING/EDITING SCHEDULE**
-   - Remove:
+8. **REMOVING/EDITING**
+   - Remove schedule:
      ```SCHEDULE_REMOVE
-     {{"date": "YYYY-MM-DD", "task_keyword": "keyword to match"}}
+     {{"date": "YYYY-MM-DD", "task_keyword": "keyword"}}
      ```
-   - Edit:
+   - Edit schedule:
      ```SCHEDULE_EDIT
-     {{"date": "YYYY-MM-DD", "task_keyword": "old keyword", "new_time": "HH:MM", "new_task": "new description"}}
+     {{"date": "YYYY-MM-DD", "task_keyword": "keyword", "new_time": "HH:MM", "new_task": "description"}}
      ```
-
-9. **REMOVING REMINDERS**
-   - Remove a reminder:
+   - Remove reminder:
      ```REMINDER_REMOVE
-     {{"task_keyword": "keyword to match"}}
+     {{"keyword": "keyword to match in reminder message"}}
      ```
 
 ── TODAY'S SCHEDULE ──
 {today_schedule}
 
-{reminders_section}
+── ACTIVE REMINDERS ──
+{reminders_text}
 
 ── PRICE WATCHES ──
 {price_watches}
 {search_section}
-
 ── PERSONALITY ──
 - Warm, supportive, slightly witty
 - Remember conversation context
 - Proactive: flag conflicts, remind deadlines
-- Concise but thorough — no fluff
-- If not enough info, ask clarifying questions
-- Use emoji sparingly but naturally
-- When user is chatting/venting, listen first, structure second
-- When sharing search results, format them nicely with links
+- Concise but thorough
+- Ask clarifying questions when needed
+- Emoji sparingly but naturally
 
-── IMPORTANT RULES ──
-- NEVER say "As an AI language model..." or similar
-- NEVER say you can't search the web — you CAN via live search
-- NEVER give generic responses — reference actual context
-- If you detect scheduling intent, ALWAYS include SCHEDULE_ADD block
-- If you detect reminder intent, ALWAYS include REMINDER_ADD block
-- Schedule/reminder/price blocks must be valid JSON
-- Today is {today}. Calculate dates correctly.
+── RULES ──
+- NEVER say "As an AI language model..."
+- NEVER say you can't search the web
+- NEVER give generic responses
+- If scheduling intent → SCHEDULE_ADD block
+- If reminder intent → REMINDER_ADD block (ALWAYS)
+- All command blocks must be valid JSON
+- Today is {today}, current time is {current_time}
 """
 
 
 # ── Claude API call ──────────────────────────────────────────────────────────
 def ask_claude(user_id: int, user_message: str) -> str:
-    # Step 1: Decide if search is needed
+    # Step 1: Decide if search needed
     search_decision = decide_if_search_needed(user_message)
     search_context = ""
 
     if search_decision.get("needs_search"):
         queries = search_decision.get("search_queries", [])
-        search_type = search_decision.get("search_type", "general")
-
-        logger.info(f"Search needed. Type: {search_type}, Queries: {queries}")
-
+        logger.info(f"Search needed. Queries: {queries}")
         all_results = []
-        for query in queries[:3]:  # Max 3 searches per message
+        for query in queries[:3]:
             result = web_search(query)
-            all_results.append(f"**Search: {query}**\n{result}")
-
+            all_results.append(f"Search: {query}\n{result}")
         search_context = "\n---\n".join(all_results)
 
-    # Step 2: Build system prompt with search context
+    # Step 2: Build prompt with search context
     system_prompt = build_system_prompt(user_id, search_context)
 
-    # Add user message to history
     append_message(user_id, "user", user_message)
-
-    # Build messages for API
     messages = get_history(user_id)
 
     try:
@@ -564,25 +392,20 @@ def ask_claude(user_id: int, user_message: str) -> str:
             system=system_prompt,
             messages=messages,
         )
-
         assistant_text = response.content[0].text
-
-        # Save assistant response to history
         append_message(user_id, "assistant", assistant_text)
 
-        # Process commands
+        # Process all command blocks
         process_schedule_commands(assistant_text)
-        process_reminder_commands(assistant_text)
         process_price_watch_commands(assistant_text)
+        reminder_data = process_reminder_commands(assistant_text, user_id)
 
-        # Clean response
         clean_text = clean_response(assistant_text)
-
-        return clean_text
+        return clean_text, reminder_data
 
     except Exception as e:
         logger.error(f"Claude API error: {e}")
-        return f"⚠️ Something went wrong talking to Claude: {str(e)[:200]}"
+        return f"⚠️ Something went wrong: {str(e)[:200]}", None
 
 
 # ── Command processing ───────────────────────────────────────────────────────
@@ -605,9 +428,9 @@ def process_schedule_commands(text: str):
             schedule[date_key].append(entry)
             schedule[date_key].sort(key=lambda x: x.get("time", "99:99"))
             changed = True
-            logger.info(f"Added schedule item: {entry} on {date_key}")
+            logger.info(f"Added schedule: {entry} on {date_key}")
         except (json.JSONDecodeError, KeyError, IndexError) as e:
-            logger.error(f"Failed to parse SCHEDULE_ADD: {e}")
+            logger.error(f"SCHEDULE_ADD parse error: {e}")
 
     if "```SCHEDULE_REMOVE" in text:
         try:
@@ -616,16 +439,15 @@ def process_schedule_commands(text: str):
             date_key = data["date"]
             keyword = data.get("task_keyword", "").lower()
             if date_key in schedule:
-                original_len = len(schedule[date_key])
+                before = len(schedule[date_key])
                 schedule[date_key] = [
-                    item for item in schedule[date_key]
-                    if keyword not in item.get("task", "").lower()
+                    i for i in schedule[date_key]
+                    if keyword not in i.get("task", "").lower()
                 ]
-                if len(schedule[date_key]) < original_len:
+                if len(schedule[date_key]) < before:
                     changed = True
-                    logger.info(f"Removed schedule item matching '{keyword}' on {date_key}")
         except (json.JSONDecodeError, KeyError, IndexError) as e:
-            logger.error(f"Failed to parse SCHEDULE_REMOVE: {e}")
+            logger.error(f"SCHEDULE_REMOVE parse error: {e}")
 
     if "```SCHEDULE_EDIT" in text:
         try:
@@ -641,77 +463,73 @@ def process_schedule_commands(text: str):
                         if "new_task" in data:
                             item["task"] = data["new_task"]
                         changed = True
-                        logger.info(f"Edited schedule item matching '{keyword}' on {date_key}")
                         break
                 schedule[date_key].sort(key=lambda x: x.get("time", "99:99"))
         except (json.JSONDecodeError, KeyError, IndexError) as e:
-            logger.error(f"Failed to parse SCHEDULE_EDIT: {e}")
+            logger.error(f"SCHEDULE_EDIT parse error: {e}")
 
     if changed:
         save_schedule(schedule)
 
 
-def process_reminder_commands(text: str):
-    """Process REMINDER_ADD and REMINDER_REMOVE commands."""
-    if "```REMINDER_ADD" in text:
-        try:
-            block = text.split("```REMINDER_ADD")[1].split("```")[0].strip()
-            data = json.loads(block)
-            
-            date = data.get("date")
-            time = data.get("time")
-            task = data.get("task")
-            notes = data.get("notes", "")
-            
-            # Extract user_id from context — you'll need to pass this
-            # For now, we'll need to modify this function signature
-            if date and time and task:
-                logger.info(f"Reminder command parsed: {task} on {date} at {time}")
-                # Will be processed in handle_text with user_id
-        except (json.JSONDecodeError, KeyError, IndexError) as e:
-            logger.error(f"Failed to parse REMINDER_ADD: {e}")
-
-    if "```REMINDER_REMOVE" in text:
-        try:
-            block = text.split("```REMINDER_REMOVE")[1].split("```")[0].strip()
-            data = json.loads(block)
-            keyword = data.get("task_keyword", "")
-            logger.info(f"Reminder remove command parsed: {keyword}")
-        except (json.JSONDecodeError, KeyError, IndexError) as e:
-            logger.error(f"Failed to parse REMINDER_REMOVE: {e}")
-
-
-def process_reminder_commands_with_user(text: str, user_id: int):
-    """Process REMINDER_ADD and REMINDER_REMOVE commands with user_id."""
-    if reminder_manager is None:
-        return
+def process_reminder_commands(text: str, user_id: int) -> dict | None:
+    """Process reminder commands and return reminder data for job scheduling."""
+    reminder_data = None
 
     if "```REMINDER_ADD" in text:
         try:
             block = text.split("```REMINDER_ADD")[1].split("```")[0].strip()
             data = json.loads(block)
-            
-            date = data.get("date")
-            time = data.get("time")
-            task = data.get("task")
-            notes = data.get("notes", "")
-            
-            if date and time and task:
-                reminder_manager.add_reminder(user_id, task, date, time, notes)
-                logger.info(f"Added reminder for user {user_id}: {task} on {date} at {time}")
-        except (json.JSONDecodeError, KeyError, IndexError) as e:
-            logger.error(f"Failed to parse REMINDER_ADD: {e}")
+
+            reminder_dt_str = data.get("datetime", "")
+            message = data.get("message", "Reminder!")
+
+            # Parse the datetime
+            reminder_dt = datetime.strptime(reminder_dt_str, "%Y-%m-%d %H:%M")
+            reminder_dt = reminder_dt.replace(tzinfo=TZ)
+
+            # Save to file
+            reminders = load_reminders()
+            reminder_entry = {
+                "datetime": reminder_dt_str,
+                "message": message,
+                "user_id": user_id,
+                "sent": False,
+                "created": get_now().isoformat(),
+            }
+            reminders.append(reminder_entry)
+            save_reminders(reminders)
+
+            reminder_data = {
+                "datetime": reminder_dt,
+                "message": message,
+                "user_id": user_id,
+            }
+
+            logger.info(f"Added reminder: '{message}' at {reminder_dt_str} for user {user_id}")
+
+        except (json.JSONDecodeError, KeyError, IndexError, ValueError) as e:
+            logger.error(f"REMINDER_ADD parse error: {e}")
 
     if "```REMINDER_REMOVE" in text:
         try:
             block = text.split("```REMINDER_REMOVE")[1].split("```")[0].strip()
             data = json.loads(block)
-            keyword = data.get("task_keyword", "")
-            
-            if keyword and reminder_manager.remove_reminder(user_id, keyword):
-                logger.info(f"Removed reminder for user {user_id}: {keyword}")
+            keyword = data.get("keyword", "").lower()
+
+            reminders = load_reminders()
+            before = len(reminders)
+            reminders = [
+                r for r in reminders
+                if keyword not in r.get("message", "").lower() or r.get("sent", False)
+            ]
+            if len(reminders) < before:
+                save_reminders(reminders)
+                logger.info(f"Removed reminder matching '{keyword}'")
         except (json.JSONDecodeError, KeyError, IndexError) as e:
-            logger.error(f"Failed to parse REMINDER_REMOVE: {e}")
+            logger.error(f"REMINDER_REMOVE parse error: {e}")
+
+    return reminder_data
 
 
 def process_price_watch_commands(text: str):
@@ -725,19 +543,20 @@ def process_price_watch_commands(text: str):
             "description": data.get("description", ""),
             "search_query": data.get("search_query", ""),
             "frequency": data.get("frequency", "daily"),
-            "created": datetime.now().isoformat(),
+            "created": get_now().isoformat(),
             "last_checked": "never",
             "last_result": "",
         })
         save_price_watches(watches)
         logger.info(f"Added price watch: {data.get('description')}")
     except (json.JSONDecodeError, KeyError, IndexError) as e:
-        logger.error(f"Failed to parse PRICE_WATCH: {e}")
+        logger.error(f"PRICE_WATCH parse error: {e}")
 
 
 def clean_response(text: str) -> str:
     clean = text
-    for tag in ["SCHEDULE_ADD", "SCHEDULE_REMOVE", "SCHEDULE_EDIT", "REMINDER_ADD", "REMINDER_REMOVE", "PRICE_WATCH"]:
+    for tag in ["SCHEDULE_ADD", "SCHEDULE_REMOVE", "SCHEDULE_EDIT",
+                "REMINDER_ADD", "REMINDER_REMOVE", "PRICE_WATCH"]:
         while f"```{tag}" in clean:
             try:
                 before = clean.split(f"```{tag}")[0]
@@ -762,7 +581,7 @@ async def transcribe_voice(file_path: str) -> str:
             )
         return transcript
     except Exception as e:
-        logger.error(f"Whisper transcription error: {e}")
+        logger.error(f"Whisper error: {e}")
         return None
 
 
@@ -773,6 +592,94 @@ def is_allowed(user_id: int) -> bool:
     return str(user_id) == str(ALLOWED_USER_ID)
 
 
+# ── Reminder callback (this actually sends the notification) ─────────────────
+async def send_reminder(context: CallbackContext):
+    """Called by JobQueue when reminder time arrives."""
+    job_data = context.job.data
+    chat_id = job_data["chat_id"]
+    message = job_data["message"]
+    user_id = job_data["user_id"]
+
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=f"⏰ **REMINDER**\n\n{message}",
+        parse_mode="Markdown",
+    )
+
+    logger.info(f"Sent reminder to {user_id}: {message}")
+
+    # Mark as sent in storage
+    reminders = load_reminders()
+    for r in reminders:
+        if r.get("message") == message and r.get("user_id") == user_id and not r.get("sent"):
+            r["sent"] = True
+            break
+    save_reminders(reminders)
+
+
+def schedule_reminder_job(application, reminder_data: dict, chat_id: int):
+    """Schedule a reminder using python-telegram-bot's JobQueue."""
+    reminder_dt = reminder_data["datetime"]
+    now = get_now()
+
+    delay_seconds = (reminder_dt - now).total_seconds()
+
+    if delay_seconds <= 0:
+        logger.warning(f"Reminder time already passed: {reminder_dt}")
+        delay_seconds = 5  # Send in 5 seconds if time already passed
+
+    job_data = {
+        "chat_id": chat_id,
+        "message": reminder_data["message"],
+        "user_id": reminder_data["user_id"],
+    }
+
+    application.job_queue.run_once(
+        send_reminder,
+        when=delay_seconds,
+        data=job_data,
+        name=f"reminder_{reminder_data['user_id']}_{reminder_data['message'][:20]}",
+    )
+
+    logger.info(f"Scheduled reminder job in {delay_seconds:.0f} seconds ({reminder_dt})")
+
+
+# ── Background checker for reminders saved to disk ───────────────────────────
+async def check_saved_reminders(context: CallbackContext):
+    """Periodic check for any reminders that need to fire (backup for restarts)."""
+    reminders = load_reminders()
+    now = get_now()
+    changed = False
+
+    for r in reminders:
+        if r.get("sent", False):
+            continue
+
+        try:
+            reminder_dt = datetime.strptime(r["datetime"], "%Y-%m-%d %H:%M").replace(tzinfo=TZ)
+        except (ValueError, KeyError):
+            continue
+
+        if reminder_dt <= now:
+            user_id = r.get("user_id")
+            chat_id = get_chat_id(user_id)
+            if chat_id:
+                try:
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=f"⏰ **REMINDER**\n\n{r.get('message', 'Reminder!')}",
+                        parse_mode="Markdown",
+                    )
+                    r["sent"] = True
+                    changed = True
+                    logger.info(f"Backup checker sent reminder: {r.get('message')}")
+                except Exception as e:
+                    logger.error(f"Failed to send reminder: {e}")
+
+    if changed:
+        save_reminders(reminders)
+
+
 # ── Telegram handlers ───────────────────────────────────────────────────────
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update.effective_user.id):
@@ -780,27 +687,29 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    save_chat_id(user_id, chat_id)
     user_conversations[str(user_id)] = []
 
     await update.message.reply_text(
         "Hey! 👋 I'm Shanti, your personal assistant.\n\n"
         "Here's what I can do:\n"
-        "• 📅 Schedule things — just tell me your plans naturally\n"
-        "• ⏰ Set reminders — \"remind me to buy groceries on Tuesday at 10am\"\n"
+        "• 📅 Schedule things — just tell me naturally\n"
+        "• ⏰ Set reminders — \"remind me in 2 hours to call mom\"\n"
         "• 📋 Daily/weekly summaries — /today or /week\n"
         "• 🧠 Structure your random thoughts & voice notes\n"
         "• 🎤 Send voice messages — I'll transcribe and organize\n"
         "• ✈️ Search flights, events, prices — just ask!\n"
-        "• 👀 Watch prices for you — /watches to see active ones\n\n"
+        "• 👀 Watch prices — /watches to see active ones\n\n"
         "Commands:\n"
         "/today — today's schedule\n"
         "/week — this week's schedule\n"
-        "/reminders — show all upcoming reminders\n"
+        "/reminders — see active reminders\n"
         "/search <query> — force a web search\n"
-        "/watches — see active price watches\n"
-        "/checkprices — manually check all watched prices\n"
+        "/watches — see price watches\n"
+        "/checkprices — check all watched prices\n"
         "/clear — clear conversation history\n"
-        "/clearschedule — wipe all schedule data\n"
+        "/clearschedule — wipe schedule\n"
         "/clearreminders — wipe all reminders\n\n"
         "Or just start talking! 💬"
     )
@@ -809,36 +718,29 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def today_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update.effective_user.id):
         return
-    text = get_today_schedule_text()
-    await update.message.reply_text(text, parse_mode="Markdown")
+    save_chat_id(update.effective_user.id, update.effective_chat.id)
+    await update.message.reply_text(get_today_schedule_text())
 
 
 async def week_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update.effective_user.id):
         return
-    text = get_week_schedule_text()
-    await update.message.reply_text(text, parse_mode="Markdown")
+    save_chat_id(update.effective_user.id, update.effective_chat.id)
+    await update.message.reply_text(get_week_schedule_text())
 
 
 async def reminders_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update.effective_user.id):
         return
-    
-    user_id = update.effective_user.id
-    if reminder_manager:
-        text = reminder_manager.get_upcoming_reminders(user_id)
-    else:
-        text = "Reminder system not initialized."
-    
-    await update.message.reply_text(text, parse_mode="Markdown")
+    save_chat_id(update.effective_user.id, update.effective_chat.id)
+    await update.message.reply_text(get_reminders_text())
 
 
 async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update.effective_user.id):
         return
-    user_id = update.effective_user.id
-    user_conversations[str(user_id)] = []
-    await update.message.reply_text("🧹 Conversation history cleared. Fresh start!")
+    user_conversations[str(update.effective_user.id)] = []
+    await update.message.reply_text("🧹 Conversation history cleared!")
 
 
 async def clear_schedule_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -851,45 +753,41 @@ async def clear_schedule_command(update: Update, context: ContextTypes.DEFAULT_T
 async def clear_reminders_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update.effective_user.id):
         return
-    
-    if reminder_manager:
-        reminder_manager.reminders_data = {}
-        reminder_manager.save_reminders()
-        await update.message.reply_text("🗑️ All reminders cleared.")
-    else:
-        await update.message.reply_text("Reminder system not initialized.")
+    save_reminders([])
+    # Cancel all reminder jobs
+    jobs = context.application.job_queue.get_jobs_by_name("")
+    # Cancel jobs for this user
+    current_jobs = context.application.job_queue.jobs()
+    for job in current_jobs:
+        if hasattr(job, 'name') and job.name and job.name.startswith("reminder_"):
+            job.schedule_removal()
+    await update.message.reply_text("🗑️ All reminders cleared.")
 
 
 async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update.effective_user.id):
         return
+    save_chat_id(update.effective_user.id, update.effective_chat.id)
 
     query = " ".join(context.args) if context.args else ""
     if not query:
-        await update.message.reply_text("Usage: /search <your query>\nExample: /search flights Berlin to Tokyo March 2025")
+        await update.message.reply_text("Usage: /search <query>")
         return
 
     await update.message.chat.send_action("typing")
     results = web_search(query)
 
-    # Send results through Claude for nice formatting
     user_id = update.effective_user.id
-    message = f"I just searched the web for: \"{query}\"\n\nHere are the results, please summarize them nicely:\n\n{results}"
-    response = ask_claude(user_id, message)
+    msg = f"I searched for: \"{query}\"\n\nResults:\n\n{results}"
+    response, _ = ask_claude(user_id, msg)
 
-    if len(response) > 4000:
-        chunks = [response[i:i + 4000] for i in range(0, len(response), 4000)]
-        for chunk in chunks:
-            await update.message.reply_text(chunk)
-    else:
-        await update.message.reply_text(response)
+    await send_long_message(update, response)
 
 
 async def watches_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update.effective_user.id):
         return
-    text = get_price_watches_text()
-    await update.message.reply_text(text, parse_mode="Markdown")
+    await update.message.reply_text(get_price_watches_text())
 
 
 async def check_prices_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -898,34 +796,27 @@ async def check_prices_command(update: Update, context: ContextTypes.DEFAULT_TYP
 
     watches = load_price_watches()
     if not watches:
-        await update.message.reply_text("No active price watches. Tell me what to track!")
+        await update.message.reply_text("No active price watches.")
         return
 
-    await update.message.reply_text(f"🔍 Checking {len(watches)} price watch(es)...")
+    await update.message.reply_text(f"🔍 Checking {len(watches)} watch(es)...")
     await update.message.chat.send_action("typing")
 
     user_id = update.effective_user.id
     all_results = []
-
-    for i, watch in enumerate(watches):
+    for watch in watches:
         query = watch.get("search_query", watch.get("description", ""))
         result = web_search(query)
-        watch["last_checked"] = datetime.now().isoformat()
+        watch["last_checked"] = get_now().isoformat()
         watch["last_result"] = result[:500]
-        all_results.append(f"**{watch['description']}:**\n{result}")
+        all_results.append(f"{watch['description']}:\n{result}")
 
     save_price_watches(watches)
-
     combined = "\n---\n".join(all_results)
-    message = f"Here are the latest results for my price watches. Summarize the key findings, highlight any good deals:\n\n{combined}"
-    response = ask_claude(user_id, message)
+    msg = f"Price watch results. Summarize key findings and deals:\n\n{combined}"
+    response, _ = ask_claude(user_id, msg)
 
-    if len(response) > 4000:
-        chunks = [response[i:i + 4000] for i in range(0, len(response), 4000)]
-        for chunk in chunks:
-            await update.message.reply_text(chunk)
-    else:
-        await update.message.reply_text(response)
+    await send_long_message(update, response)
 
 
 async def clear_watches_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -940,23 +831,21 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     user_id = update.effective_user.id
-    user_text = update.message.text
+    chat_id = update.effective_chat.id
+    save_chat_id(user_id, chat_id)
 
+    user_text = update.message.text
     logger.info(f"Text from {user_id}: {user_text[:100]}...")
 
     await update.message.chat.send_action("typing")
 
-    response = ask_claude(user_id, user_text)
-    
-    # Process reminder commands with user_id
-    process_reminder_commands_with_user(response, user_id)
+    response, reminder_data = ask_claude(user_id, user_text)
 
-    if len(response) > 4000:
-        chunks = [response[i:i + 4000] for i in range(0, len(response), 4000)]
-        for chunk in chunks:
-            await update.message.reply_text(chunk)
-    else:
-        await update.message.reply_text(response)
+    # If a reminder was created, schedule the actual job
+    if reminder_data:
+        schedule_reminder_job(context.application, reminder_data, chat_id)
+
+    await send_long_message(update, response)
 
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -964,61 +853,43 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    save_chat_id(user_id, chat_id)
 
     await update.message.reply_text("🎤 Got your voice note, transcribing...")
     await update.message.chat.send_action("typing")
 
     voice = update.message.voice or update.message.audio
     if not voice:
-        await update.message.reply_text("Hmm, couldn't get the audio. Try again?")
+        await update.message.reply_text("Couldn't get the audio. Try again?")
         return
 
     file = await context.bot.get_file(voice.file_id)
-
     with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
         tmp_path = tmp.name
         await file.download_to_drive(tmp_path)
 
     try:
         transcript = await transcribe_voice(tmp_path)
-
         if transcript is None:
             await update.message.reply_text("⚠️ Couldn't transcribe. Try again or type it out?")
             return
 
-        logger.info(f"Voice transcription from {user_id}: {transcript[:100]}...")
+        logger.info(f"Voice from {user_id}: {transcript[:100]}...")
 
         voice_message = (
-            f"[VOICE NOTE TRANSCRIPTION]\n"
-            f"{transcript}\n"
-            f"[END VOICE NOTE]\n\n"
+            f"[VOICE NOTE TRANSCRIPTION]\n{transcript}\n[END VOICE NOTE]\n\n"
             f"Please structure and respond to this voice note."
         )
 
         await update.message.chat.send_action("typing")
-        response = ask_claude(user_id, voice_message)
-        
-        # Process reminder commands with user_id
-        process_reminder_commands_with_user(response, user_id)
+        response, reminder_data = ask_claude(user_id, voice_message)
 
-        full_response = f"📝 *Transcription:*\n_{transcript}_\n\n---\n\n{response}"
+        if reminder_data:
+            schedule_reminder_job(context.application, reminder_data, chat_id)
 
-        if len(full_response) > 4000:
-            await update.message.reply_text(
-                f"📝 *Transcription:*\n_{transcript}_",
-                parse_mode="Markdown",
-            )
-            if len(response) > 4000:
-                chunks = [response[i:i + 4000] for i in range(0, len(response), 4000)]
-                for chunk in chunks:
-                    await update.message.reply_text(chunk)
-            else:
-                await update.message.reply_text(response)
-        else:
-            try:
-                await update.message.reply_text(full_response, parse_mode="Markdown")
-            except Exception:
-                await update.message.reply_text(full_response)
+        full_response = f"📝 Transcription:\n{transcript}\n\n---\n\n{response}"
+        await send_long_message(update, full_response)
 
     finally:
         try:
@@ -1027,20 +898,76 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
 
+async def send_long_message(update: Update, text: str):
+    """Send a message, splitting if too long for Telegram."""
+    if len(text) > 4000:
+        chunks = [text[i:i + 4000] for i in range(0, len(text), 4000)]
+        for chunk in chunks:
+            await update.message.reply_text(chunk)
+    else:
+        await update.message.reply_text(text)
+
+
+# ── Startup: reschedule any pending reminders ────────────────────────────────
+async def post_init(application: Application):
+    """On startup, reschedule any pending reminders from disk."""
+    reminders = load_reminders()
+    now = get_now()
+    rescheduled = 0
+
+    for r in reminders:
+        if r.get("sent", False):
+            continue
+
+        try:
+            reminder_dt = datetime.strptime(r["datetime"], "%Y-%m-%d %H:%M").replace(tzinfo=TZ)
+        except (ValueError, KeyError):
+            continue
+
+        user_id = r.get("user_id")
+        chat_id = get_chat_id(user_id)
+        if not chat_id:
+            continue
+
+        delay = (reminder_dt - now).total_seconds()
+        if delay <= 0:
+            delay = 5  # Fire soon if overdue
+
+        job_data = {
+            "chat_id": chat_id,
+            "message": r.get("message", "Reminder!"),
+            "user_id": user_id,
+        }
+
+        application.job_queue.run_once(
+            send_reminder,
+            when=delay,
+            data=job_data,
+            name=f"reminder_{user_id}_{r.get('message', '')[:20]}",
+        )
+        rescheduled += 1
+
+    if rescheduled:
+        logger.info(f"Rescheduled {rescheduled} pending reminders from disk")
+
+    # Also start periodic checker as backup (every 60 seconds)
+    application.job_queue.run_repeating(
+        check_saved_reminders,
+        interval=60,
+        first=10,
+        name="reminder_checker",
+    )
+    logger.info("Started periodic reminder checker")
+
+
 # ── Main ─────────────────────────────────────────────────────────────────────
-async def post_init(app: Application):
-    """Called after bot is initialized."""
-    global reminder_manager
-    reminder_manager = ReminderManager(app)
-    reminder_manager.start()
-    logger.info("Reminder manager initialized and started")
-
-
 def main():
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
-
-    # Initialize reminder manager after bot starts
-    app.post_init = post_init
+    app = (
+        Application.builder()
+        .token(TELEGRAM_TOKEN)
+        .post_init(post_init)
+        .build()
+    )
 
     # Commands
     app.add_handler(CommandHandler("start", start_command))
@@ -1058,10 +985,10 @@ def main():
     # Voice messages
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
 
-    # Text messages (catch-all, must be last)
+    # Text messages (catch-all, last)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    logger.info("Shanti bot is starting...")
+    logger.info("Shanti bot starting...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
