@@ -2,7 +2,7 @@ import os
 import json
 import logging
 import tempfile
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -34,7 +34,6 @@ TAVILY_API_KEY = os.environ["TAVILY_API_KEY"]
 
 ALLOWED_USER_ID = os.environ.get("ALLOWED_USER_ID")
 
-# Set your timezone here — change to yours
 USER_TIMEZONE = os.environ.get("USER_TIMEZONE", "Europe/Berlin")
 TZ = ZoneInfo(USER_TIMEZONE)
 
@@ -66,7 +65,7 @@ def save_json(path: Path, data):
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 
-# ── Chat ID tracking (maps user_id -> chat_id) ──────────────────────────────
+# ── Chat ID tracking ────────────────────────────────────────────────────────
 def save_chat_id(user_id: int, chat_id: int):
     data = load_json(CHAT_IDS_FILE, {})
     data[str(user_id)] = chat_id
@@ -310,7 +309,7 @@ Timezone: {USER_TIMEZONE}
    - Brain dumps → organize into: key themes, action items, ideas to revisit, emotional check-in.
 
 5. **VOICE NOTES**
-   - Transcribed voice → treat as brain dumps unless specific requests. Structure the content.
+   - Transcribed voice/audio → treat as brain dumps unless specific requests. Structure the content.
 
 6. **WEB SEARCH & LIVE INFO**
    - You have live web search. When results are provided, USE them with specific prices/dates/links.
@@ -365,7 +364,7 @@ Timezone: {USER_TIMEZONE}
 
 
 # ── Claude API call ──────────────────────────────────────────────────────────
-def ask_claude(user_id: int, user_message: str) -> str:
+def ask_claude(user_id: int, user_message: str):
     # Step 1: Decide if search needed
     search_decision = decide_if_search_needed(user_message)
     search_context = ""
@@ -473,7 +472,6 @@ def process_schedule_commands(text: str):
 
 
 def process_reminder_commands(text: str, user_id: int) -> dict | None:
-    """Process reminder commands and return reminder data for job scheduling."""
     reminder_data = None
 
     if "```REMINDER_ADD" in text:
@@ -484,11 +482,9 @@ def process_reminder_commands(text: str, user_id: int) -> dict | None:
             reminder_dt_str = data.get("datetime", "")
             message = data.get("message", "Reminder!")
 
-            # Parse the datetime
             reminder_dt = datetime.strptime(reminder_dt_str, "%Y-%m-%d %H:%M")
             reminder_dt = reminder_dt.replace(tzinfo=TZ)
 
-            # Save to file
             reminders = load_reminders()
             reminder_entry = {
                 "datetime": reminder_dt_str,
@@ -570,7 +566,57 @@ def clean_response(text: str) -> str:
     return clean.strip()
 
 
-# ── Voice transcription ──────────────────────────────────────────────────────
+# ── Audio file detection ─────────────────────────────────────────────────────
+SUPPORTED_AUDIO_EXTENSIONS = {
+    ".mp3", ".mp4", ".m4a", ".wav", ".ogg", ".oga",
+    ".flac", ".webm", ".mpga", ".mpeg",
+}
+SUPPORTED_AUDIO_MIMES = {"audio/", "video/mp4", "application/octet-stream"}
+
+
+def is_audio_document(document) -> bool:
+    if not document:
+        return False
+    mime = (document.mime_type or "").lower()
+    if any(mime.startswith(m) for m in SUPPORTED_AUDIO_MIMES):
+        return True
+    name = (document.file_name or "").lower()
+    if any(name.endswith(ext) for ext in SUPPORTED_AUDIO_EXTENSIONS):
+        return True
+    return False
+
+
+def get_file_extension(mime_type: str = "", file_name: str = "") -> str:
+    if file_name:
+        name_lower = file_name.lower()
+        for ext in SUPPORTED_AUDIO_EXTENSIONS:
+            if name_lower.endswith(ext):
+                return ext
+    mime_map = {
+        "audio/mpeg": ".mp3",
+        "audio/mp3": ".mp3",
+        "audio/mp4": ".m4a",
+        "audio/mp4a-latm": ".m4a",
+        "audio/x-m4a": ".m4a",
+        "audio/m4a": ".m4a",
+        "audio/ogg": ".ogg",
+        "audio/wav": ".wav",
+        "audio/x-wav": ".wav",
+        "audio/flac": ".flac",
+        "audio/webm": ".webm",
+        "video/mp4": ".mp4",
+        "audio/mpeg3": ".mp3",
+        "audio/x-mpeg-3": ".mp3",
+    }
+    mime_lower = (mime_type or "").lower()
+    if mime_lower in mime_map:
+        return mime_map[mime_lower]
+    if mime_lower.startswith("audio/"):
+        return ".ogg"
+    return ".ogg"
+
+
+# ── Voice transcription ─────────────────────────────────────────────────────
 async def transcribe_voice(file_path: str) -> str:
     try:
         with open(file_path, "rb") as audio_file:
@@ -592,23 +638,22 @@ def is_allowed(user_id: int) -> bool:
     return str(user_id) == str(ALLOWED_USER_ID)
 
 
-# ── Reminder callback (this actually sends the notification) ─────────────────
+# ── Reminder job callbacks ──────────────────────────────────────────────────
 async def send_reminder(context: CallbackContext):
-    """Called by JobQueue when reminder time arrives."""
     job_data = context.job.data
     chat_id = job_data["chat_id"]
     message = job_data["message"]
     user_id = job_data["user_id"]
 
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text=f"⏰ **REMINDER**\n\n{message}",
-        parse_mode="Markdown",
-    )
+    try:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"⏰ REMINDER\n\n{message}",
+        )
+        logger.info(f"Sent reminder to {user_id}: {message}")
+    except Exception as e:
+        logger.error(f"Failed to send reminder: {e}")
 
-    logger.info(f"Sent reminder to {user_id}: {message}")
-
-    # Mark as sent in storage
     reminders = load_reminders()
     for r in reminders:
         if r.get("message") == message and r.get("user_id") == user_id and not r.get("sent"):
@@ -618,15 +663,12 @@ async def send_reminder(context: CallbackContext):
 
 
 def schedule_reminder_job(application, reminder_data: dict, chat_id: int):
-    """Schedule a reminder using python-telegram-bot's JobQueue."""
     reminder_dt = reminder_data["datetime"]
     now = get_now()
 
     delay_seconds = (reminder_dt - now).total_seconds()
-
     if delay_seconds <= 0:
-        logger.warning(f"Reminder time already passed: {reminder_dt}")
-        delay_seconds = 5  # Send in 5 seconds if time already passed
+        delay_seconds = 5
 
     job_data = {
         "chat_id": chat_id,
@@ -641,12 +683,10 @@ def schedule_reminder_job(application, reminder_data: dict, chat_id: int):
         name=f"reminder_{reminder_data['user_id']}_{reminder_data['message'][:20]}",
     )
 
-    logger.info(f"Scheduled reminder job in {delay_seconds:.0f} seconds ({reminder_dt})")
+    logger.info(f"Scheduled reminder in {delay_seconds:.0f}s ({reminder_dt})")
 
 
-# ── Background checker for reminders saved to disk ───────────────────────────
 async def check_saved_reminders(context: CallbackContext):
-    """Periodic check for any reminders that need to fire (backup for restarts)."""
     reminders = load_reminders()
     now = get_now()
     changed = False
@@ -654,7 +694,6 @@ async def check_saved_reminders(context: CallbackContext):
     for r in reminders:
         if r.get("sent", False):
             continue
-
         try:
             reminder_dt = datetime.strptime(r["datetime"], "%Y-%m-%d %H:%M").replace(tzinfo=TZ)
         except (ValueError, KeyError):
@@ -667,17 +706,26 @@ async def check_saved_reminders(context: CallbackContext):
                 try:
                     await context.bot.send_message(
                         chat_id=chat_id,
-                        text=f"⏰ **REMINDER**\n\n{r.get('message', 'Reminder!')}",
-                        parse_mode="Markdown",
+                        text=f"⏰ REMINDER\n\n{r.get('message', 'Reminder!')}",
                     )
                     r["sent"] = True
                     changed = True
-                    logger.info(f"Backup checker sent reminder: {r.get('message')}")
+                    logger.info(f"Backup sent reminder: {r.get('message')}")
                 except Exception as e:
                     logger.error(f"Failed to send reminder: {e}")
 
     if changed:
         save_reminders(reminders)
+
+
+# ── Send long messages helper ────────────────────────────────────────────────
+async def send_long_message(update: Update, text: str):
+    if len(text) > 4000:
+        chunks = [text[i:i + 4000] for i in range(0, len(text), 4000)]
+        for chunk in chunks:
+            await update.message.reply_text(chunk)
+    else:
+        await update.message.reply_text(text)
 
 
 # ── Telegram handlers ───────────────────────────────────────────────────────
@@ -698,7 +746,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• ⏰ Set reminders — \"remind me in 2 hours to call mom\"\n"
         "• 📋 Daily/weekly summaries — /today or /week\n"
         "• 🧠 Structure your random thoughts & voice notes\n"
-        "• 🎤 Send voice messages — I'll transcribe and organize\n"
+        "• 🎤 Send voice messages or audio files (mp3, m4a, etc)\n"
         "• ✈️ Search flights, events, prices — just ask!\n"
         "• 👀 Watch prices — /watches to see active ones\n\n"
         "Commands:\n"
@@ -754,12 +802,9 @@ async def clear_reminders_command(update: Update, context: ContextTypes.DEFAULT_
     if not is_allowed(update.effective_user.id):
         return
     save_reminders([])
-    # Cancel all reminder jobs
-    jobs = context.application.job_queue.get_jobs_by_name("")
-    # Cancel jobs for this user
     current_jobs = context.application.job_queue.jobs()
     for job in current_jobs:
-        if hasattr(job, 'name') and job.name and job.name.startswith("reminder_"):
+        if hasattr(job, "name") and job.name and job.name.startswith("reminder_"):
             job.schedule_removal()
     await update.message.reply_text("🗑️ All reminders cleared.")
 
@@ -841,7 +886,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     response, reminder_data = ask_claude(user_id, user_text)
 
-    # If a reminder was created, schedule the actual job
     if reminder_data:
         schedule_reminder_job(context.application, reminder_data, chat_id)
 
@@ -856,26 +900,56 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     save_chat_id(user_id, chat_id)
 
-    await update.message.reply_text("🎤 Got your voice note, transcribing...")
-    await update.message.chat.send_action("typing")
+    # Determine source: voice, audio, or document
+    voice = update.message.voice
+    audio = update.message.audio
+    document = update.message.document
 
-    voice = update.message.voice or update.message.audio
-    if not voice:
-        await update.message.reply_text("Couldn't get the audio. Try again?")
+    file_id = None
+    mime_type = ""
+    file_name = ""
+
+    if voice:
+        file_id = voice.file_id
+        mime_type = voice.mime_type or "audio/ogg"
+        file_name = "voice.ogg"
+        logger.info(f"Received voice message from {user_id}")
+    elif audio:
+        file_id = audio.file_id
+        mime_type = audio.mime_type or ""
+        file_name = audio.file_name or "audio"
+        logger.info(f"Received audio '{file_name}' ({mime_type}) from {user_id}")
+    elif document and is_audio_document(document):
+        file_id = document.file_id
+        mime_type = document.mime_type or ""
+        file_name = document.file_name or "file"
+        logger.info(f"Received audio document '{file_name}' ({mime_type}) from {user_id}")
+    else:
         return
 
-    file = await context.bot.get_file(voice.file_id)
-    with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
+    await update.message.reply_text("🎤 Got your audio, transcribing...")
+    await update.message.chat.send_action("typing")
+
+    ext = get_file_extension(mime_type, file_name)
+
+    file = await context.bot.get_file(file_id)
+    with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
         tmp_path = tmp.name
         await file.download_to_drive(tmp_path)
+
+    logger.info(f"Downloaded audio to {tmp_path} (ext: {ext}, mime: {mime_type})")
 
     try:
         transcript = await transcribe_voice(tmp_path)
         if transcript is None:
-            await update.message.reply_text("⚠️ Couldn't transcribe. Try again or type it out?")
+            await update.message.reply_text(
+                "⚠️ Couldn't transcribe this audio.\n\n"
+                "Supported formats: MP3, M4A, MP4, WAV, OGG, FLAC, WEBM\n"
+                "Try converting the file or sending as a voice note."
+            )
             return
 
-        logger.info(f"Voice from {user_id}: {transcript[:100]}...")
+        logger.info(f"Transcription from {user_id}: {transcript[:100]}...")
 
         voice_message = (
             f"[VOICE NOTE TRANSCRIPTION]\n{transcript}\n[END VOICE NOTE]\n\n"
@@ -898,19 +972,16 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
 
-async def send_long_message(update: Update, text: str):
-    """Send a message, splitting if too long for Telegram."""
-    if len(text) > 4000:
-        chunks = [text[i:i + 4000] for i in range(0, len(text), 4000)]
-        for chunk in chunks:
-            await update.message.reply_text(chunk)
-    else:
-        await update.message.reply_text(text)
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update.effective_user.id):
+        return
+    document = update.message.document
+    if document and is_audio_document(document):
+        await handle_voice(update, context)
 
 
-# ── Startup: reschedule any pending reminders ────────────────────────────────
+# ── Startup ─────────────────────────────────────────────────────────────────
 async def post_init(application: Application):
-    """On startup, reschedule any pending reminders from disk."""
     reminders = load_reminders()
     now = get_now()
     rescheduled = 0
@@ -918,7 +989,6 @@ async def post_init(application: Application):
     for r in reminders:
         if r.get("sent", False):
             continue
-
         try:
             reminder_dt = datetime.strptime(r["datetime"], "%Y-%m-%d %H:%M").replace(tzinfo=TZ)
         except (ValueError, KeyError):
@@ -931,7 +1001,7 @@ async def post_init(application: Application):
 
         delay = (reminder_dt - now).total_seconds()
         if delay <= 0:
-            delay = 5  # Fire soon if overdue
+            delay = 5
 
         job_data = {
             "chat_id": chat_id,
@@ -950,7 +1020,6 @@ async def post_init(application: Application):
     if rescheduled:
         logger.info(f"Rescheduled {rescheduled} pending reminders from disk")
 
-    # Also start periodic checker as backup (every 60 seconds)
     application.job_queue.run_repeating(
         check_saved_reminders,
         interval=60,
@@ -982,10 +1051,13 @@ def main():
     app.add_handler(CommandHandler("checkprices", check_prices_command))
     app.add_handler(CommandHandler("clearwatches", clear_watches_command))
 
-    # Voice messages
+    # Voice and audio messages
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
 
-    # Text messages (catch-all, last)
+    # Documents (catches mp3/m4a/etc sent as files from Apple Files etc)
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+
+    # Text messages (catch-all, MUST be last)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     logger.info("Shanti bot starting...")
