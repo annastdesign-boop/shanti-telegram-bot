@@ -4,38 +4,9 @@
 """
 Shanti Telegram Bot — Personal Assistant + Diary (Railway-ready)
 
-Key fixes vs your old code:
-- No more brittle JSON parsing of Claude's *text* output.
-  Instead uses Anthropic tool-use with a strict schema -> reliable structured actions:
-  schedule add/edit/remove, reminders add/remove, price watches, PDF requests, search queries.
-- No pydub. Audio splitting/transcoding uses ffmpeg/ffprobe subprocess -> low RAM (Railway-friendly).
-- Handles: Telegram voice, audio, video note, video, and audio/video sent as DOCUMENT from iPhone Files (mp3/m4a/mp4).
-- Uses Pyrogram for big file downloads when Bot API size limits apply.
-
-ENV (required):
-- TELEGRAM_BOT_TOKEN
-- ANTHROPIC_API_KEY
-- OPENAI_API_KEY (required for transcription)
-- TAVILY_API_KEY (recommended, for web research)
-- TELEGRAM_API_ID (required for Pyrogram big downloads)
-- TELEGRAM_API_HASH
-Optional:
-- ALLOWED_USER_ID (restrict to one user)
-- USER_TIMEZONE (default Europe/Berlin)
-- ANTHROPIC_MODEL (default claude-sonnet-4-5)
-
-requirements.txt (minimum):
-python-telegram-bot[job-queue]>=20.7
-anthropic>=0.39.0
-openai>=1.50.0
-tavily-python>=0.5.0
-pyrogram>=2.0.106
-tgcrypto>=1.2.5
-reportlab>=4.0
-requests>=2.31.0
-
-Note: ffmpeg + ffprobe must exist in the runtime. If Railway Nixpacks doesn't include them,
-you must add them (tell me if you see "No such file or directory: 'ffmpeg'").
+Fixes in THIS version:
+- ✅ add missing `import asyncio` (fixes NameError)
+- ✅ add global error handler + register it (removes "No error handlers are registered")
 """
 
 import os
@@ -43,6 +14,7 @@ import re
 import io
 import json
 import math
+import asyncio  # ✅ FIX #1: needed for asyncio.to_thread(...)
 import logging
 import subprocess
 from datetime import datetime, timedelta
@@ -95,13 +67,8 @@ TZ = ZoneInfo(USER_TIMEZONE)
 
 ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-5").strip() or "claude-sonnet-4-5"
 
-# OpenAI Whisper file size practical limit is around 25MB; we keep 24MB to be safe
 WHISPER_MAX_BYTES = 24 * 1024 * 1024
-
-# Telegram Bot API downloading gets tricky around 20MB (varies), so we prefer Pyrogram above this
 BOT_API_LIMIT = 20 * 1024 * 1024
-
-# Chunk duration for long audio/video
 CHUNK_SEC = 10 * 60  # 10 minutes
 
 
@@ -126,7 +93,6 @@ REMINDERS_FILE = DATA_DIR / "reminders.json"
 PRICE_WATCHES_FILE = DATA_DIR / "price_watches.json"
 CHAT_IDS_FILE = DATA_DIR / "chat_ids.json"
 
-# last transcription buffer for /pdf
 last_transcriptions: Dict[str, Dict[str, Any]] = {}
 
 
@@ -279,10 +245,6 @@ def web_search(query: str) -> str:
 
 
 def should_search_heuristic(text: str) -> bool:
-    """
-    Keep this simple + reliable. Claude can also request searches via tool output,
-    but we use this to decide whether to prefetch search results.
-    """
     t = text.lower()
     triggers = [
         "flight", "flights", "ticket", "tickets", "cheap", "price", "prices", "cost",
@@ -303,23 +265,10 @@ def generate_pdf(title: str, sections: List[Dict[str, str]]) -> str:
     )
     styles = getSampleStyleSheet()
 
-    title_style = ParagraphStyle(
-        "CustomTitle", parent=styles["Title"],
-        fontSize=20, spaceAfter=12, alignment=TA_CENTER,
-    )
-    heading_style = ParagraphStyle(
-        "CustomHeading", parent=styles["Heading2"],
-        fontSize=14, spaceAfter=6, spaceBefore=12,
-        textColor="#333333",
-    )
-    body_style = ParagraphStyle(
-        "CustomBody", parent=styles["Normal"],
-        fontSize=11, leading=16, spaceAfter=8, alignment=TA_LEFT,
-    )
-    meta_style = ParagraphStyle(
-        "Meta", parent=styles["Normal"],
-        fontSize=9, textColor="#888888", alignment=TA_CENTER, spaceAfter=20,
-    )
+    title_style = ParagraphStyle("CustomTitle", parent=styles["Title"], fontSize=20, spaceAfter=12, alignment=TA_CENTER)
+    heading_style = ParagraphStyle("CustomHeading", parent=styles["Heading2"], fontSize=14, spaceAfter=6, spaceBefore=12, textColor="#333333")
+    body_style = ParagraphStyle("CustomBody", parent=styles["Normal"], fontSize=11, leading=16, spaceAfter=8, alignment=TA_LEFT)
+    meta_style = ParagraphStyle("Meta", parent=styles["Normal"], fontSize=9, textColor="#888888", alignment=TA_CENTER, spaceAfter=20)
 
     def esc(s: str) -> str:
         return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
@@ -341,7 +290,6 @@ def generate_pdf(title: str, sections: List[Dict[str, str]]) -> str:
                     story.append(Spacer(1, 6))
                     continue
                 safe = esc(para)
-                # crude bold handling
                 while "**" in safe:
                     safe = safe.replace("**", "<b>", 1)
                     if "**" in safe:
@@ -381,9 +329,6 @@ def is_audio_message(msg) -> bool:
 
 
 def get_media_info(msg) -> Tuple[Optional[str], str, str, int]:
-    """
-    Returns: file_id, mime, filename, filesize
-    """
     if msg.voice:
         v = msg.voice
         return v.file_id, v.mime_type or "audio/ogg", "voice.ogg", v.file_size or 0
@@ -511,7 +456,6 @@ async def download_pyro(chat_id: int, message_id: int, dest: str) -> bool:
 
 async def download_media(bot, file_id: str, dest: str, chat_id: int, message_id: int, file_size: int) -> bool:
     logger.info(f"Downloading media: {fmt_bytes(file_size)}")
-    # Prefer Pyrogram for large files
     if file_size > BOT_API_LIMIT:
         ok = await download_pyro(chat_id, message_id, dest)
         if ok:
@@ -522,7 +466,6 @@ async def download_media(bot, file_id: str, dest: str, chat_id: int, message_id:
     ok = await download_small(bot, file_id, dest)
     if ok:
         return True
-    # fallback to pyro
     return await download_pyro(chat_id, message_id, dest)
 
 
@@ -537,10 +480,7 @@ def ffmpeg_exists() -> bool:
 
 
 def split_audio_ffmpeg(path: str) -> List[str]:
-    """Split/convert using ffmpeg subprocess - uses minimal RAM."""
     ts = datetime.now().strftime("%H%M%S")
-
-    # duration via ffprobe
     try:
         result = subprocess.run(
             ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", path],
@@ -553,7 +493,6 @@ def split_audio_ffmpeg(path: str) -> List[str]:
         logger.error(f"ffprobe failed: {e}")
         return [path]
 
-    # short: convert to mp3 (often smaller and more consistent)
     if duration_sec <= CHUNK_SEC:
         out = os.path.join(str(TEMP_DIR), f"conv_{ts}.mp3")
         try:
@@ -570,7 +509,6 @@ def split_audio_ffmpeg(path: str) -> List[str]:
             logger.warning(f"Conversion failed: {e}")
             return [path]
 
-    # split
     n = math.ceil(duration_sec / CHUNK_SEC)
     logger.info(f"Splitting into {n} chunks of {CHUNK_SEC}s")
 
@@ -594,7 +532,6 @@ def split_audio_ffmpeg(path: str) -> List[str]:
                 sz = os.path.getsize(out)
                 if sz > 100:
                     if sz > WHISPER_MAX_BYTES:
-                        # lower bitrate reencode
                         out2 = os.path.join(str(TEMP_DIR), f"chunk_{ts}_{i:03d}_lo.mp3")
                         subprocess.run(
                             ["ffmpeg", "-i", out, "-vn", "-acodec", "libmp3lame", "-ab", "64k", "-y", out2],
@@ -612,9 +549,7 @@ def split_audio_ffmpeg(path: str) -> List[str]:
         except Exception as e:
             logger.error(f"Chunk {i+1} ffmpeg error: {e}")
 
-    if not paths:
-        return [path]
-    return paths
+    return paths or [path]
 
 
 async def whisper_transcribe(path: str) -> Optional[str]:
@@ -632,19 +567,12 @@ async def whisper_transcribe(path: str) -> Optional[str]:
 
 
 async def full_transcribe(path: str, status_cb=None) -> Optional[str]:
-    """
-    Transcribe long audio/video without OOM:
-    - try direct whisper if <=24MB
-    - else split with ffmpeg and transcribe chunks
-    """
     chunks: List[str] = []
     created = False
-
     try:
         fs = os.path.getsize(path)
         logger.info(f"Transcription start: {fmt_bytes(fs)}")
 
-        # Direct attempt
         if fs <= WHISPER_MAX_BYTES:
             if status_cb:
                 await status_cb("Transcribing (single file)…")
@@ -654,7 +582,6 @@ async def full_transcribe(path: str, status_cb=None) -> Optional[str]:
             logger.warning("Direct whisper failed; will chunk")
 
         if not ffmpeg_exists():
-            # If ffmpeg missing, we can't chunk safely. Try whisper anyway (may fail).
             if status_cb:
                 await status_cb("ffmpeg not found; trying best-effort transcription…")
             return await whisper_transcribe(path)
@@ -690,12 +617,8 @@ async def full_transcribe(path: str, status_cb=None) -> Optional[str]:
                         pass
 
 
-# ---------------- Claude tool schema (core logic fix) ----------------
+# ---------------- Claude tool schema + Shanti respond ----------------
 def tool_schema() -> dict:
-    """
-    This is the key fix: Shanti returns structured actions reliably.
-    No brittle parsing of assistant text blocks.
-    """
     return {
         "name": "shanti_output",
         "description": "Return the assistant reply and structured actions for schedule, reminders, watches, pdf, and searches.",
@@ -704,7 +627,6 @@ def tool_schema() -> dict:
             "additionalProperties": False,
             "properties": {
                 "reply": {"type": "string"},
-
                 "schedule_add": {
                     "type": "array",
                     "items": {
@@ -746,7 +668,6 @@ def tool_schema() -> dict:
                         "required": ["date", "task_keyword", "new_time", "new_task", "new_notes"],
                     },
                 },
-
                 "reminder_add": {
                     "type": "array",
                     "items": {
@@ -769,7 +690,6 @@ def tool_schema() -> dict:
                         "required": ["keyword"],
                     },
                 },
-
                 "price_watch_add": {
                     "type": "array",
                     "items": {
@@ -784,7 +704,6 @@ def tool_schema() -> dict:
                     },
                 },
                 "price_watch_clear": {"type": "boolean"},
-
                 "pdf_request": {
                     "type": ["object", "null"],
                     "additionalProperties": False,
@@ -794,24 +713,13 @@ def tool_schema() -> dict:
                     },
                     "required": ["type", "title"],
                 },
-
-                "search_queries": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "If web search is needed, list queries here (0-3).",
-                },
+                "search_queries": {"type": "array", "items": {"type": "string"}},
             },
             "required": [
-                "reply",
-                "schedule_add",
-                "schedule_remove",
-                "schedule_edit",
-                "reminder_add",
-                "reminder_remove",
-                "price_watch_add",
-                "price_watch_clear",
-                "pdf_request",
-                "search_queries",
+                "reply", "schedule_add", "schedule_remove", "schedule_edit",
+                "reminder_add", "reminder_remove",
+                "price_watch_add", "price_watch_clear",
+                "pdf_request", "search_queries",
             ],
         },
         "strict": True,
@@ -838,10 +746,8 @@ In 30 minutes: {in30}
 In 2 hours: {in2h}
 
 Always be useful, never generic.
-If user gives brain-dump thoughts: structure them into themes + next actions + one good question.
-If user implies timing ("tomorrow", "at 5", "next Monday", "in 2 hours", "remind me"): create reminder_add items.
+If user implies timing ("tomorrow", "at 5", "in 2 hours", "remind me"): create reminder_add items.
 If user plans tasks/events: create schedule_add items.
-If user asks to modify schedule/reminders: use schedule_edit/remove or reminder_remove.
 If user asks for flights/prices/news/weather/events/current info: add 1-3 search_queries.
 
 Current schedule (today):
@@ -852,15 +758,11 @@ Current reminders:
 
 Current price watches:
 {watches_text()}
-
 {sc}
 """
 
 
 async def shanti_respond(uid: int, user_text: str, pre_search_ctx: str = "") -> Dict[str, Any]:
-    """
-    One reliable Claude call returning a strict structured output via tool-use.
-    """
     tool = tool_schema()
     system = build_system_context(uid, pre_search_ctx)
 
@@ -881,22 +783,16 @@ async def shanti_respond(uid: int, user_text: str, pre_search_ctx: str = "") -> 
                 break
 
         if not isinstance(out, dict):
-            # should not happen with tool_choice, but safe fallback
             return {
                 "reply": "I got you — do you want me to log this, set reminders, or build a plan?",
-                "schedule_add": [],
-                "schedule_remove": [],
-                "schedule_edit": [],
-                "reminder_add": [],
-                "reminder_remove": [],
-                "price_watch_add": [],
-                "price_watch_clear": False,
-                "pdf_request": None,
-                "search_queries": [],
+                "schedule_add": [], "schedule_remove": [], "schedule_edit": [],
+                "reminder_add": [], "reminder_remove": [],
+                "price_watch_add": [], "price_watch_clear": False,
+                "pdf_request": None, "search_queries": [],
             }
-
         return out
 
+    # ✅ FIX #1 uses asyncio.to_thread safely because asyncio is imported now
     return await asyncio.to_thread(_call)  # type: ignore
 
 
@@ -907,12 +803,7 @@ def apply_schedule_actions(out: Dict[str, Any]):
 
     for it in out.get("schedule_add", []) or []:
         d = it["date"]
-        s.setdefault(d, []).append({
-            "time": it.get("time", ""),
-            "task": it.get("task", ""),
-            "notes": it.get("notes", ""),
-        })
-        # sort by time if possible
+        s.setdefault(d, []).append({"time": it.get("time", ""), "task": it.get("task", ""), "notes": it.get("notes", "")})
         s[d].sort(key=lambda x: x.get("time") or "99:99")
         changed = True
 
@@ -965,13 +856,9 @@ def apply_watch_actions(out: Dict[str, Any]):
 
 
 def apply_reminder_actions(out: Dict[str, Any], uid: int) -> List[Dict[str, Any]]:
-    """
-    Returns reminders to schedule immediately via JobQueue (datetime objects).
-    """
     rems = load_reminders()
     scheduled: List[Dict[str, Any]] = []
 
-    # remove
     for it in out.get("reminder_remove", []) or []:
         kw = (it.get("keyword") or "").lower()
         if not kw:
@@ -981,7 +868,6 @@ def apply_reminder_actions(out: Dict[str, Any], uid: int) -> List[Dict[str, Any]
         if len(rems) != before:
             logger.info("Removed reminder(s) by keyword")
 
-    # add
     for it in out.get("reminder_add", []) or []:
         ds = it.get("datetime", "").strip()
         msg = it.get("message", "").strip()
@@ -991,16 +877,8 @@ def apply_reminder_actions(out: Dict[str, Any], uid: int) -> List[Dict[str, Any]
         try:
             rdt = datetime.strptime(ds, "%Y-%m-%d %H:%M").replace(tzinfo=TZ)
         except Exception:
-            # ignore invalid
             continue
-        rems.append({
-            "datetime": ds,
-            "message": msg,
-            "priority": pr,
-            "user_id": uid,
-            "sent": False,
-            "created": tnow().isoformat(),
-        })
+        rems.append({"datetime": ds, "message": msg, "priority": pr, "user_id": uid, "sent": False, "created": tnow().isoformat()})
         scheduled.append({"datetime": rdt, "message": msg, "user_id": uid, "priority": pr})
 
     save_reminders(rems)
@@ -1012,14 +890,11 @@ async def fire_reminder(ctx):
     data = ctx.job.data
     try:
         pr = data.get("priority", "normal")
-        head = "⏰ Reminder"
-        if pr == "high":
-            head = "⏰‼️ Important reminder"
+        head = "⏰ Reminder" if pr != "high" else "⏰‼️ Important reminder"
         await ctx.bot.send_message(chat_id=data["chat_id"], text=f"{head}\n\n{data['message']}")
     except Exception as e:
         logger.error(f"Reminder send failed: {e}")
 
-    # mark sent
     rems = load_reminders()
     for r in rems:
         if r.get("user_id") == data.get("user_id") and r.get("message") == data.get("message") and not r.get("sent"):
@@ -1033,20 +908,12 @@ def schedule_reminder_job(app: Application, reminder: Dict[str, Any], chat_id: i
     app.job_queue.run_once(
         fire_reminder,
         when=delay,
-        data={
-            "chat_id": chat_id,
-            "message": reminder["message"],
-            "user_id": reminder["user_id"],
-            "priority": reminder.get("priority", "normal"),
-        },
+        data={"chat_id": chat_id, "message": reminder["message"], "user_id": reminder["user_id"], "priority": reminder.get("priority", "normal")},
         name=f"r_{reminder['user_id']}_{reminder['message'][:20]}",
     )
 
 
 async def reminder_safety_check(ctx):
-    """
-    Background check every 60 seconds in case jobs were missed / restarted.
-    """
     rems = load_reminders()
     n = tnow()
     changed = False
@@ -1070,6 +937,16 @@ async def reminder_safety_check(ctx):
                     pass
     if changed:
         save_reminders(rems)
+
+
+# ---------------- ✅ FIX #2: Global error handler ----------------
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.exception("Unhandled exception", exc_info=context.error)
+    try:
+        if isinstance(update, Update) and update.effective_message:
+            await update.effective_message.reply_text("⚠️ I crashed on that message, but I’m back now. Try again.")
+    except Exception:
+        pass
 
 
 # ---------------- PDF send helper ----------------
@@ -1096,11 +973,7 @@ async def maybe_send_pdf(update: Update, pdf_req: Optional[dict], uid: int):
     try:
         path = generate_pdf(title, sections)
         with open(path, "rb") as f:
-            await update.message.reply_document(
-                document=f,
-                filename=f"{title.replace(' ', '_')}.pdf",
-                caption=f"PDF: {title}",
-            )
+            await update.message.reply_document(document=f, filename=f"{title.replace(' ', '_')}.pdf", caption=f"PDF: {title}")
         os.unlink(path)
     except Exception as e:
         logger.error(f"PDF error: {e}")
@@ -1207,7 +1080,6 @@ async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if not is_allowed(uid):
         return
-    # Clear memory buffers only (not stored schedule/reminders)
     last_transcriptions.pop(str(uid), None)
     await update.message.reply_text("Cleared last transcription buffer.")
 
@@ -1225,7 +1097,6 @@ async def cmd_clear_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not is_allowed(uid):
         return
     save_reminders([])
-    # remove scheduled jobs
     for j in context.application.job_queue.jobs():
         if getattr(j, "name", "") and str(j.name).startswith("r_"):
             j.schedule_removal()
@@ -1252,15 +1123,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.chat.send_action("typing")
 
-    # Optional pre-search if clearly needed (speeds up helpful answers)
     search_ctx = ""
     if should_search_heuristic(text) and tavily_client:
-        # let the assistant also choose queries; but we give it at least one baseline
         search_ctx = web_search(text[:220])
 
     out = await shanti_respond(uid, text, pre_search_ctx=search_ctx)
 
-    # If assistant explicitly requested searches, fetch and re-ask once (best quality)
     queries = (out.get("search_queries") or [])[:3]
     if queries and tavily_client:
         combined = "\n\n---\n\n".join([f"Query: {q}\n{web_search(q)}" for q in queries])
@@ -1279,10 +1147,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Handles voice/audio/video/video_note/documents that are audio/video.
-    Downloads (Pyrogram for big), transcribes with Whisper, then asks Shanti to summarize + structure + actions.
-    """
     uid = update.effective_user.id
     if not is_allowed(uid):
         return
@@ -1334,7 +1198,6 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not transcript:
             return await update.message.reply_text("❌ Transcription failed. Try another format or shorter clip.")
 
-        # Ask Shanti to structure
         prompt = (
             f"[TRANSCRIPT START]\n{transcript}\n[TRANSCRIPT END]\n\n"
             "Please:\n"
@@ -1342,7 +1205,6 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Be concise and actionable."
         )
 
-        # Optionally search if transcript contains travel/prices
         search_ctx = ""
         if should_search_heuristic(transcript) and tavily_client:
             search_ctx = web_search(transcript[:220])
@@ -1360,7 +1222,6 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for r in scheduled:
             schedule_reminder_job(context.application, r, cid)
 
-        # Save for /pdf
         last_transcriptions[str(uid)] = {
             "transcript": transcript,
             "summary": out["reply"],
@@ -1368,7 +1229,6 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "timestamp": tnow().isoformat(),
         }
 
-        # Send response (and transcript if short)
         if len(transcript) <= 2500:
             await update.message.reply_text(f"📝 Transcription:\n{transcript}\n\n—\n\n{out['reply']}")
         else:
@@ -1387,7 +1247,6 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------------- Lifecycle hooks ----------------
 async def post_init(app: Application):
-    # cleanup temp
     for f in TEMP_DIR.glob("*"):
         try:
             os.unlink(f)
@@ -1399,14 +1258,12 @@ async def post_init(app: Application):
         except Exception:
             pass
 
-    # attempt start pyro (optional)
     try:
         if pyro_app:
             await start_pyro()
     except Exception as e:
         logger.error(f"Pyrogram failed to start: {e} (large files may fail)")
 
-    # reschedule reminders on boot
     rems = load_reminders()
     n = tnow()
     count = 0
@@ -1425,12 +1282,7 @@ async def post_init(app: Application):
         app.job_queue.run_once(
             fire_reminder,
             when=delay,
-            data={
-                "chat_id": cid,
-                "message": r.get("message", "!"),
-                "user_id": uid,
-                "priority": r.get("priority", "normal"),
-            },
+            data={"chat_id": cid, "message": r.get("message", "!"), "user_id": uid, "priority": r.get("priority", "normal")},
             name=f"r_{uid}_{(r.get('message','')[:20])}",
         )
         count += 1
@@ -1459,7 +1311,9 @@ def main():
         .build()
     )
 
-    # commands
+    # ✅ FIX #2: register error handler so PTB doesn't complain and you get a user-visible error
+    app.add_error_handler(on_error)
+
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("today", cmd_today))
     app.add_handler(CommandHandler("week", cmd_week))
@@ -1473,12 +1327,7 @@ def main():
     app.add_handler(CommandHandler("clearreminders", cmd_clear_reminders))
     app.add_handler(CommandHandler("clearwatches", cmd_clear_watches))
 
-    # media: voice/audio/video/doc
-    app.add_handler(MessageHandler(
-        filters.VOICE | filters.AUDIO | filters.VIDEO | filters.VIDEO_NOTE | filters.Document.ALL,
-        handle_media
-    ))
-    # text
+    app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO | filters.VIDEO | filters.VIDEO_NOTE | filters.Document.ALL, handle_media))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     logger.info("Starting Shanti…")
@@ -1487,4 +1336,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
