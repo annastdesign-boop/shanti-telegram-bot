@@ -694,29 +694,40 @@ def split_audio(path):
         "flac": "flac", "webm": "webm", "aac": "aac", "opus": "ogg",
     }.get(ext, "mp3")
     try:
+        logger.info(f"Loading audio with format={fm}...")
         audio = AudioSegment.from_file(path, format=fm)
-    except Exception:
+    except Exception as e1:
+        logger.warning(f"Format {fm} failed: {e1}, trying auto-detect...")
         try:
             audio = AudioSegment.from_file(path)
-        except Exception as e:
-            logger.error(f"Cannot load audio: {e}")
+        except Exception as e2:
+            logger.error(f"Cannot load audio: {e2}")
             raise
 
     d = len(audio)
     fs = os.path.getsize(path)
-    logger.info(f"Audio loaded: {dur_text(d)}, {fmt(fs)}")
+    logger.info(f"Audio loaded OK: {dur_text(d)}, {fmt(fs)}")
+
     if fs <= WHISPER_MAX_BYTES and d <= CHUNK_DURATION_MS:
+        logger.info("File small enough, no splitting needed")
         return [path]
+
     n = math.ceil(d / CHUNK_DURATION_MS)
-    logger.info(f"Splitting into {n} chunks")
+    logger.info(f"Splitting {dur_text(d)} into {n} chunks of ~10min each")
     paths = []
+    ts = datetime.now().strftime("%H%M%S")
+
     for i in range(n):
         s = i * CHUNK_DURATION_MS
         e = min((i + 1) * CHUNK_DURATION_MS, d)
-        p = os.path.join(str(TEMP_DIR), f"c_{os.getpid()}{i:03d}.mp3")
+        p = os.path.join(str(TEMP_DIR), f"chunk_{ts}_{i:03d}.mp3")
+        logger.info(f"Exporting chunk {i+1}/{n}: {dur_text(e-s)}...")
         audio[s:e].export(p, format="mp3", bitrate="128k")
         cs = os.path.getsize(p)
+        logger.info(f"Chunk {i+1} exported: {fmt(cs)}")
+
         if cs > WHISPER_MAX_BYTES:
+            logger.warning(f"Chunk {i+1} too large ({fmt(cs)}), sub-splitting...")
             os.unlink(p)
             sd = CHUNK_DURATION_MS // 3
             for j in range(3):
@@ -724,12 +735,70 @@ def split_audio(path):
                 se = min(s + (j + 1) * sd, e)
                 if ss >= e:
                     break
-                sp = os.path.join(str(TEMP_DIR), f"c{os.getpid()}{i:03d}{j}.mp3")
+                sp = os.path.join(str(TEMP_DIR), f"chunk_{ts}_{i:03d}_{j}.mp3")
                 audio[ss:se].export(sp, format="mp3", bitrate="96k")
+                logger.info(f"Sub-chunk {j+1}: {fmt(os.path.getsize(sp))}")
                 paths.append(sp)
         else:
             paths.append(p)
+
+    logger.info(f"Split complete: {len(paths)} chunks ready")
     return paths
+
+
+async def full_transcribe(path, status_cb=None):
+    chunks = []
+    created = False
+    try:
+        fs = os.path.getsize(path)
+        logger.info(f"Starting transcription: {fmt(fs)}")
+
+        if fs <= WHISPER_MAX_BYTES:
+            logger.info("Small file, direct Whisper...")
+            r = await whisper_transcribe(path)
+            if r:
+                logger.info(f"Direct transcription OK: {len(r)} chars")
+                return r
+            logger.warning("Direct transcription failed, will try chunking")
+
+        if status_cb:
+            await status_cb("Splitting audio into chunks...")
+
+        chunks = split_audio(path)
+        created = len(chunks) > 1 or chunks[0] != path
+
+        if created and status_cb:
+            await status_cb(f"{len(chunks)} chunks ready. Starting transcription...")
+
+        parts = []
+        for i, cp in enumerate(chunks):
+            logger.info(f"Transcribing chunk {i+1}/{len(chunks)}: {fmt(os.path.getsize(cp))}")
+            if status_cb and len(chunks) > 1:
+                await status_cb(f"Transcribing chunk {i + 1}/{len(chunks)}...")
+            t = await whisper_transcribe(cp)
+            if t:
+                parts.append(t.strip())
+                logger.info(f"Chunk {i+1} OK: {len(t)} chars")
+            else:
+                parts.append(f"[Chunk {i + 1} failed]")
+                logger.error(f"Chunk {i+1} transcription failed")
+
+        result = "\n\n".join(parts)
+        logger.info(f"Full transcription complete: {len(result)} chars from {len(chunks)} chunks")
+        return result
+
+    except Exception as e:
+        logger.error(f"Transcription error: {type(e).__name__}: {e}")
+        return None
+
+    finally:
+        if created:
+            for cp in chunks:
+                if cp != path:
+                    try:
+                        os.unlink(cp)
+                    except Exception:
+                        pass
 
 
 async def whisper_transcribe(path):
