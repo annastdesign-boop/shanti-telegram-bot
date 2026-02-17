@@ -1,3 +1,4 @@
+```dockerfile
 FROM python:3.11-slim
 
 RUN apt-get update && \
@@ -12,6 +13,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-RUN mkdir -p data temp_audio
+RUN mkdir -p data temp_audio temp_pdf
 
 CMD ["python", "telegram_diary_bot.py"]
