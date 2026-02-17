@@ -2,6 +2,7 @@ import os
 import json
 import logging
 import tempfile
+import math
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -9,6 +10,7 @@ from zoneinfo import ZoneInfo
 import openai
 from anthropic import Anthropic
 from tavily import TavilyClient
+from pydub import AudioSegment
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -37,6 +39,17 @@ ALLOWED_USER_ID = os.environ.get("ALLOWED_USER_ID")
 USER_TIMEZONE = os.environ.get("USER_TIMEZONE", "Europe/Berlin")
 TZ = ZoneInfo(USER_TIMEZONE)
 
+# ── Whisper limits ───────────────────────────────────────────────────────────
+# OpenAI Whisper max file size is 25MB. We chunk at 24MB to be safe.
+WHISPER_MAX_BYTES = 24 * 1024 * 1024  # 24 MB
+# Each chunk duration in milliseconds (10 minutes per chunk)
+CHUNK_DURATION_MS = 10 * 60 * 1000  # 10 minutes
+
+# Telegram Bot API file download limit is 20MB.
+# For larger files we need a local Bot API server OR the file URL trick.
+# We'll handle this with a custom download approach.
+TELEGRAM_FILE_LIMIT = 20 * 1024 * 1024  # 20 MB
+
 # ── Clients ──────────────────────────────────────────────────────────────────
 anthropic_client = Anthropic(api_key=ANTHROPIC_API_KEY)
 openai_client = openai.OpenAI(api_key=OPENAI_API_KEY)
@@ -45,6 +58,8 @@ tavily_client = TavilyClient(api_key=TAVILY_API_KEY)
 # ── Persistent storage ──────────────────────────────────────────────────────
 DATA_DIR = Path("data")
 DATA_DIR.mkdir(exist_ok=True)
+TEMP_DIR = Path("temp_audio")
+TEMP_DIR.mkdir(exist_ok=True)
 SCHEDULE_FILE = DATA_DIR / "schedule.json"
 PRICE_WATCHES_FILE = DATA_DIR / "price_watches.json"
 REMINDERS_FILE = DATA_DIR / "reminders.json"
@@ -300,7 +315,6 @@ Timezone: {USER_TIMEZONE}
      - "remind me tomorrow at 9am" → {(get_now() + timedelta(days=1)).strftime("%Y-%m-%d")} 09:00
      - "remind me in 2 hours" → {(get_now() + timedelta(hours=2)).strftime("%Y-%m-%d %H:%M")}
    - ALWAYS include the REMINDER_ADD block when the user wants to be reminded.
-   - The reminder will be sent as a Telegram notification at that exact time.
 
 3. **DAILY SUMMARY**
    - When asked for summary — provide schedule + active reminders cleanly.
@@ -308,8 +322,10 @@ Timezone: {USER_TIMEZONE}
 4. **THOUGHT STRUCTURING**
    - Brain dumps → organize into: key themes, action items, ideas to revisit, emotional check-in.
 
-5. **VOICE NOTES**
-   - Transcribed voice/audio → treat as brain dumps unless specific requests. Structure the content.
+5. **VOICE NOTES & LONG AUDIO**
+   - Transcribed voice/audio → treat as brain dumps unless specific requests.
+   - Long recordings (meetings, lectures, podcasts) will be fully transcribed.
+   - For long transcriptions: provide a structured summary with key points, action items, and notable quotes.
 
 6. **WEB SEARCH & LIVE INFO**
    - You have live web search. When results are provided, USE them with specific prices/dates/links.
@@ -387,7 +403,7 @@ def ask_claude(user_id: int, user_message: str):
     try:
         response = anthropic_client.messages.create(
             model="claude-sonnet-4-20250514",
-            max_tokens=3000,
+            max_tokens=4096,
             system=system_prompt,
             messages=messages,
         )
@@ -502,7 +518,7 @@ def process_reminder_commands(text: str, user_id: int) -> dict | None:
                 "user_id": user_id,
             }
 
-            logger.info(f"Added reminder: '{message}' at {reminder_dt_str} for user {user_id}")
+            logger.info(f"Added reminder: '{message}' at {reminder_dt_str}")
 
         except (json.JSONDecodeError, KeyError, IndexError, ValueError) as e:
             logger.error(f"REMINDER_ADD parse error: {e}")
@@ -569,7 +585,7 @@ def clean_response(text: str) -> str:
 # ── Audio file detection ─────────────────────────────────────────────────────
 SUPPORTED_AUDIO_EXTENSIONS = {
     ".mp3", ".mp4", ".m4a", ".wav", ".ogg", ".oga",
-    ".flac", ".webm", ".mpga", ".mpeg",
+    ".flac", ".webm", ".mpga", ".mpeg", ".aac", ".wma",
 }
 SUPPORTED_AUDIO_MIMES = {"audio/", "video/mp4", "application/octet-stream"}
 
@@ -599,6 +615,7 @@ def get_file_extension(mime_type: str = "", file_name: str = "") -> str:
         "audio/mp4a-latm": ".m4a",
         "audio/x-m4a": ".m4a",
         "audio/m4a": ".m4a",
+        "audio/aac": ".aac",
         "audio/ogg": ".ogg",
         "audio/wav": ".wav",
         "audio/x-wav": ".wav",
@@ -616,8 +633,116 @@ def get_file_extension(mime_type: str = "", file_name: str = "") -> str:
     return ".ogg"
 
 
-# ── Voice transcription ─────────────────────────────────────────────────────
-async def transcribe_voice(file_path: str) -> str:
+# ── Audio chunking and transcription ─────────────────────────────────────────
+def get_audio_duration_text(duration_ms: int) -> str:
+    """Convert milliseconds to human readable duration."""
+    total_seconds = duration_ms // 1000
+    hours = total_seconds // 3600
+    minutes = (total_seconds % 3600) // 60
+    seconds = total_seconds % 60
+    if hours > 0:
+        return f"{hours}h {minutes}m {seconds}s"
+    elif minutes > 0:
+        return f"{minutes}m {seconds}s"
+    else:
+        return f"{seconds}s"
+
+
+def split_audio_to_chunks(file_path: str, chunk_duration_ms: int = CHUNK_DURATION_MS) -> list[str]:
+    """
+    Split an audio file into chunks that fit within Whisper's 25MB limit.
+    Returns list of temporary file paths for each chunk.
+    """
+    logger.info(f"Loading audio file: {file_path}")
+
+    # Determine format from extension
+    ext = os.path.splitext(file_path)[1].lower().lstrip(".")
+    format_map = {
+        "mp3": "mp3",
+        "m4a": "mp4",
+        "mp4": "mp4",
+        "wav": "wav",
+        "ogg": "ogg",
+        "oga": "ogg",
+        "flac": "flac",
+        "webm": "webm",
+        "aac": "aac",
+        "wma": "wma",
+        "mpga": "mp3",
+        "mpeg": "mp3",
+    }
+    audio_format = format_map.get(ext, "mp3")
+
+    try:
+        audio = AudioSegment.from_file(file_path, format=audio_format)
+    except Exception:
+        # Fallback: let pydub auto-detect
+        try:
+            audio = AudioSegment.from_file(file_path)
+        except Exception as e:
+            logger.error(f"Could not load audio file: {e}")
+            raise
+
+    duration_ms = len(audio)
+    file_size = os.path.getsize(file_path)
+
+    logger.info(f"Audio loaded: {get_audio_duration_text(duration_ms)}, {file_size / (1024*1024):.1f}MB")
+
+    # If file is small enough, no chunking needed
+    if file_size <= WHISPER_MAX_BYTES and duration_ms <= chunk_duration_ms:
+        logger.info("File is small enough, no chunking needed")
+        return [file_path]
+
+    # Calculate number of chunks
+    num_chunks = math.ceil(duration_ms / chunk_duration_ms)
+    logger.info(f"Splitting into {num_chunks} chunks of {chunk_duration_ms // 60000} minutes each")
+
+    chunk_paths = []
+    for i in range(num_chunks):
+        start_ms = i * chunk_duration_ms
+        end_ms = min((i + 1) * chunk_duration_ms, duration_ms)
+        chunk = audio[start_ms:end_ms]
+
+        # Export chunk as mp3 (good compression, Whisper supports it well)
+        chunk_path = os.path.join(
+            str(TEMP_DIR),
+            f"chunk_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{i:03d}.mp3"
+        )
+        chunk.export(chunk_path, format="mp3", bitrate="128k")
+
+        chunk_size = os.path.getsize(chunk_path)
+        logger.info(
+            f"Chunk {i+1}/{num_chunks}: "
+            f"{get_audio_duration_text(end_ms - start_ms)}, "
+            f"{chunk_size / (1024*1024):.1f}MB"
+        )
+
+        # If chunk is still too big, split it further
+        if chunk_size > WHISPER_MAX_BYTES:
+            logger.warning(f"Chunk {i+1} still too large ({chunk_size / (1024*1024):.1f}MB), splitting further")
+            os.unlink(chunk_path)
+            sub_duration = chunk_duration_ms // 3
+            for j in range(3):
+                sub_start = start_ms + (j * sub_duration)
+                sub_end = min(start_ms + ((j + 1) * sub_duration), end_ms)
+                if sub_start >= end_ms:
+                    break
+                sub_chunk = audio[sub_start:sub_end]
+                sub_path = os.path.join(
+                    str(TEMP_DIR),
+                    f"chunk_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{i:03d}_{j}.mp3"
+                )
+                sub_chunk.export(sub_path, format="mp3", bitrate="96k")
+                chunk_paths.append(sub_path)
+                logger.info(f"  Sub-chunk {j+1}: {os.path.getsize(sub_path) / (1024*1024):.1f}MB")
+        else:
+            chunk_paths.append(chunk_path)
+
+    return chunk_paths
+
+
+async def transcribe_audio_file(file_path: str) -> str:
+    """Transcribe a single audio file using Whisper."""
     try:
         with open(file_path, "rb") as audio_file:
             transcript = openai_client.audio.transcriptions.create(
@@ -627,8 +752,69 @@ async def transcribe_voice(file_path: str) -> str:
             )
         return transcript
     except Exception as e:
-        logger.error(f"Whisper error: {e}")
+        logger.error(f"Whisper error for {file_path}: {e}")
         return None
+
+
+async def transcribe_with_chunking(file_path: str, status_callback=None) -> str:
+    """
+    Transcribe an audio file of any size by chunking if necessary.
+    status_callback: async function(message) to send progress updates.
+    """
+    chunk_paths = []
+    created_chunks = False
+
+    try:
+        # Check file size
+        file_size = os.path.getsize(file_path)
+        logger.info(f"Transcribing file: {file_size / (1024*1024):.1f}MB")
+
+        # Try direct transcription first for small files
+        if file_size <= WHISPER_MAX_BYTES:
+            logger.info("File under 24MB, trying direct transcription...")
+            result = await transcribe_audio_file(file_path)
+            if result:
+                return result
+            logger.warning("Direct transcription failed, falling back to chunking")
+
+        # Split into chunks
+        if status_callback:
+            await status_callback("📎 Large file detected. Splitting into chunks for transcription...")
+
+        chunk_paths = split_audio_to_chunks(file_path)
+        created_chunks = len(chunk_paths) > 1 or chunk_paths[0] != file_path
+
+        if created_chunks and status_callback:
+            await status_callback(f"✂️ Split into {len(chunk_paths)} chunks. Transcribing...")
+
+        # Transcribe each chunk
+        all_transcripts = []
+        for i, chunk_path in enumerate(chunk_paths):
+            if status_callback and len(chunk_paths) > 1:
+                await status_callback(f"🔄 Transcribing chunk {i+1}/{len(chunk_paths)}...")
+
+            transcript = await transcribe_audio_file(chunk_path)
+            if transcript:
+                all_transcripts.append(transcript.strip())
+                logger.info(f"Chunk {i+1}/{len(chunk_paths)} transcribed: {len(transcript)} chars")
+            else:
+                all_transcripts.append(f"[Chunk {i+1} failed to transcribe]")
+                logger.error(f"Chunk {i+1} transcription failed")
+
+        # Combine all transcripts
+        full_transcript = "\n\n".join(all_transcripts)
+        logger.info(f"Full transcription complete: {len(full_transcript)} chars total")
+        return full_transcript
+
+    finally:
+        # Clean up chunk files (but not the original)
+        if created_chunks:
+            for chunk_path in chunk_paths:
+                if chunk_path != file_path:
+                    try:
+                        os.unlink(chunk_path)
+                    except OSError:
+                        pass
 
 
 # ── Access control ───────────────────────────────────────────────────────────
@@ -746,7 +932,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• ⏰ Set reminders — \"remind me in 2 hours to call mom\"\n"
         "• 📋 Daily/weekly summaries — /today or /week\n"
         "• 🧠 Structure your random thoughts & voice notes\n"
-        "• 🎤 Send voice messages or audio files (mp3, m4a, etc)\n"
+        "• 🎤 Send voice messages or audio files (mp3, m4a, wav, etc)\n"
+        "• 📻 Transcribe long recordings (meetings, lectures, podcasts — any length!)\n"
         "• ✈️ Search flights, events, prices — just ask!\n"
         "• 👀 Watch prices — /watches to see active ones\n\n"
         "Commands:\n"
@@ -893,6 +1080,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle voice messages, audio messages, and audio files sent as documents."""
     if not is_allowed(update.effective_user.id):
         return
 
@@ -908,39 +1096,70 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     file_id = None
     mime_type = ""
     file_name = ""
+    file_size = 0
 
     if voice:
         file_id = voice.file_id
         mime_type = voice.mime_type or "audio/ogg"
         file_name = "voice.ogg"
-        logger.info(f"Received voice message from {user_id}")
+        file_size = voice.file_size or 0
+        logger.info(f"Voice message from {user_id} ({file_size / 1024:.0f}KB)")
     elif audio:
         file_id = audio.file_id
         mime_type = audio.mime_type or ""
         file_name = audio.file_name or "audio"
-        logger.info(f"Received audio '{file_name}' ({mime_type}) from {user_id}")
+        file_size = audio.file_size or 0
+        logger.info(f"Audio '{file_name}' ({mime_type}, {file_size / (1024*1024):.1f}MB) from {user_id}")
     elif document and is_audio_document(document):
         file_id = document.file_id
         mime_type = document.mime_type or ""
         file_name = document.file_name or "file"
-        logger.info(f"Received audio document '{file_name}' ({mime_type}) from {user_id}")
+        file_size = document.file_size or 0
+        logger.info(f"Audio doc '{file_name}' ({mime_type}, {file_size / (1024*1024):.1f}MB) from {user_id}")
     else:
         return
 
-    await update.message.reply_text("🎤 Got your audio, transcribing...")
+    # Check Telegram's file size limit (20MB for bot API)
+    if file_size > TELEGRAM_FILE_LIMIT:
+        await update.message.reply_text(
+            f"⚠️ This file is {file_size / (1024*1024):.0f}MB. "
+            f"Telegram Bot API has a 20MB download limit.\n\n"
+            f"To transcribe larger files, please:\n"
+            f"1. Split the file into parts under 20MB, or\n"
+            f"2. Compress it (lower bitrate MP3), or\n"
+            f"3. Send as multiple voice notes\n\n"
+            f"Tip: A 2-hour recording as 64kbps MP3 is about 58MB. "
+            f"Split into 3 parts of ~40 min each."
+        )
+        return
+
+    # Size info for user
+    size_text = f"{file_size / (1024*1024):.1f}MB" if file_size > 1024*1024 else f"{file_size / 1024:.0f}KB"
+    await update.message.reply_text(f"🎤 Got your audio ({size_text}), processing...")
     await update.message.chat.send_action("typing")
 
     ext = get_file_extension(mime_type, file_name)
 
+    # Download file
     file = await context.bot.get_file(file_id)
-    with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
+    with tempfile.NamedTemporaryFile(suffix=ext, delete=False, dir=str(TEMP_DIR)) as tmp:
         tmp_path = tmp.name
         await file.download_to_drive(tmp_path)
 
-    logger.info(f"Downloaded audio to {tmp_path} (ext: {ext}, mime: {mime_type})")
+    logger.info(f"Downloaded to {tmp_path} ({os.path.getsize(tmp_path) / (1024*1024):.1f}MB)")
 
     try:
-        transcript = await transcribe_voice(tmp_path)
+        # Create a status callback to send progress updates
+        async def status_update(msg: str):
+            try:
+                await update.message.reply_text(msg)
+                await update.message.chat.send_action("typing")
+            except Exception:
+                pass
+
+        # Transcribe with chunking support
+        transcript = await transcribe_with_chunking(tmp_path, status_callback=status_update)
+
         if transcript is None:
             await update.message.reply_text(
                 "⚠️ Couldn't transcribe this audio.\n\n"
@@ -949,12 +1168,26 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        logger.info(f"Transcription from {user_id}: {transcript[:100]}...")
+        logger.info(f"Transcription from {user_id}: {len(transcript)} chars")
 
-        voice_message = (
-            f"[VOICE NOTE TRANSCRIPTION]\n{transcript}\n[END VOICE NOTE]\n\n"
-            f"Please structure and respond to this voice note."
-        )
+        # For very long transcriptions, determine if it's a meeting/lecture vs brain dump
+        transcript_length = len(transcript)
+        if transcript_length > 5000:
+            voice_message = (
+                f"[LONG AUDIO TRANSCRIPTION — {transcript_length} characters]\n"
+                f"{transcript}\n"
+                f"[END TRANSCRIPTION]\n\n"
+                f"This is a long recording. Please provide:\n"
+                f"1. A concise summary (key points)\n"
+                f"2. Action items (if any)\n"
+                f"3. Notable quotes or important details\n"
+                f"4. Any scheduling items or deadlines mentioned"
+            )
+        else:
+            voice_message = (
+                f"[VOICE NOTE TRANSCRIPTION]\n{transcript}\n[END VOICE NOTE]\n\n"
+                f"Please structure and respond to this voice note."
+            )
 
         await update.message.chat.send_action("typing")
         response, reminder_data = ask_claude(user_id, voice_message)
@@ -962,8 +1195,18 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if reminder_data:
             schedule_reminder_job(context.application, reminder_data, chat_id)
 
-        full_response = f"📝 Transcription:\n{transcript}\n\n---\n\n{response}"
-        await send_long_message(update, full_response)
+        # Send transcription separately if it's very long
+        if transcript_length > 3000:
+            # Send transcription in chunks
+            await update.message.reply_text("📝 TRANSCRIPTION:")
+            trans_chunks = [transcript[i:i + 4000] for i in range(0, len(transcript), 4000)]
+            for chunk in trans_chunks:
+                await update.message.reply_text(chunk)
+            await update.message.reply_text("---\n\n📋 SUMMARY & ANALYSIS:")
+            await send_long_message(update, response)
+        else:
+            full_response = f"📝 Transcription:\n{transcript}\n\n---\n\n{response}"
+            await send_long_message(update, full_response)
 
     finally:
         try:
@@ -973,6 +1216,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Route audio documents to the voice handler."""
     if not is_allowed(update.effective_user.id):
         return
     document = update.message.document
@@ -982,6 +1226,13 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ── Startup ─────────────────────────────────────────────────────────────────
 async def post_init(application: Application):
+    # Clean up any leftover temp files
+    for f in TEMP_DIR.glob("chunk_*"):
+        try:
+            os.unlink(f)
+        except OSError:
+            pass
+
     reminders = load_reminders()
     now = get_now()
     rescheduled = 0
@@ -1054,7 +1305,7 @@ def main():
     # Voice and audio messages
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
 
-    # Documents (catches mp3/m4a/etc sent as files from Apple Files etc)
+    # Documents (catches mp3/m4a/etc sent as files)
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 
     # Text messages (catch-all, MUST be last)
