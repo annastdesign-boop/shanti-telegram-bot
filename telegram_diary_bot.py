@@ -14,6 +14,7 @@ import re
 import io
 import json
 import math
+import base64
 import asyncio  # ✅ FIX #1: needed for asyncio.to_thread(...)
 import logging
 import subprocess
@@ -92,8 +93,12 @@ SCHEDULE_FILE = DATA_DIR / "schedule.json"
 REMINDERS_FILE = DATA_DIR / "reminders.json"
 PRICE_WATCHES_FILE = DATA_DIR / "price_watches.json"
 CHAT_IDS_FILE = DATA_DIR / "chat_ids.json"
+EXPENSES_FILE = DATA_DIR / "expenses.json"
+BRIEFING_FILE = DATA_DIR / "briefing.json"
 
 last_transcriptions: Dict[str, Dict[str, Any]] = {}
+conversation_history: Dict[str, List[Dict[str, Any]]] = {}
+MAX_HISTORY = 20
 
 
 def load_json(path: Path, default=None):
@@ -219,6 +224,63 @@ def watches_text() -> str:
     for i, x in enumerate(w, 1):
         lines.append(f"{i}. {x.get('description', '?')} — last: {x.get('last_checked', 'never')}")
     return "\n".join(lines)
+
+
+# ---------------- Expenses ----------------
+def load_expenses() -> List[dict]:
+    return load_json(EXPENSES_FILE, [])
+
+
+def save_expenses(e: List[dict]):
+    save_json(EXPENSES_FILE, e)
+
+
+def monthly_expenses_text(year_month: str = "") -> str:
+    if not year_month:
+        year_month = tnow().strftime("%Y-%m")
+    expenses = load_expenses()
+    month_exp = [e for e in expenses if e.get("date", "").startswith(year_month)]
+    if not month_exp:
+        return f"No expenses for {year_month}."
+    by_cat: Dict[str, float] = {}
+    total = 0.0
+    for e in month_exp:
+        cat = e.get("category", "other")
+        amt = e.get("amount", 0)
+        by_cat[cat] = by_cat.get(cat, 0) + amt
+        total += amt
+    currency = month_exp[0].get("currency", "EUR")
+    lines = [f"Expenses for {year_month}:"]
+    for cat, amt in sorted(by_cat.items(), key=lambda x: -x[1]):
+        lines.append(f"  {cat}: {amt:.2f} {currency}")
+    lines.append(f"  TOTAL: {total:.2f} {currency}")
+    return "\n".join(lines)
+
+
+def apply_expense_actions(out: Dict[str, Any]):
+    adds = out.get("expense_add", []) or []
+    if not adds:
+        return
+    expenses = load_expenses()
+    for e in adds:
+        expenses.append({
+            "amount": e.get("amount", 0),
+            "currency": e.get("currency", "EUR"),
+            "category": e.get("category", "other"),
+            "description": e.get("description", ""),
+            "date": tnow().strftime("%Y-%m-%d"),
+            "time": tnow().strftime("%H:%M"),
+        })
+    save_expenses(expenses)
+
+
+# ---------------- Briefing ----------------
+def load_briefing() -> dict:
+    return load_json(BRIEFING_FILE, {})
+
+
+def save_briefing(b: dict):
+    save_json(BRIEFING_FILE, b)
 
 
 # ---------------- Tavily search ----------------
@@ -714,12 +776,26 @@ def tool_schema() -> dict:
                     "required": ["type", "title"],
                 },
                 "search_queries": {"type": "array", "items": {"type": "string"}},
+                "expense_add": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "amount": {"type": "number", "description": "Numeric amount spent"},
+                            "currency": {"type": "string", "description": "Currency code e.g. EUR, USD, GBP"},
+                            "category": {"type": "string", "description": "Category: food, transport, shopping, entertainment, health, bills, travel, other"},
+                            "description": {"type": "string", "description": "Short description of the expense"},
+                        },
+                        "required": ["amount", "currency", "category", "description"],
+                    },
+                },
             },
             "required": [
                 "reply", "schedule_add", "schedule_remove", "schedule_edit",
                 "reminder_add", "reminder_remove",
                 "price_watch_add", "price_watch_clear",
-                "pdf_request", "search_queries",
+                "pdf_request", "search_queries", "expense_add",
             ],
         },
         "strict": True,
@@ -738,6 +814,8 @@ def build_system_context(uid: int, search_ctx: str = "") -> str:
     if search_ctx:
         sc = f"\n\n--- SEARCH RESULTS ---\n{search_ctx}\nUse these facts. Mention useful links if relevant.\n"
 
+    expenses_summary = monthly_expenses_text()
+
     return f"""You are Shanti — a warm, sharp personal assistant and diary organizer.
 User timezone: {USER_TIMEZONE}
 Now: {t} {tm}
@@ -749,6 +827,8 @@ Always be useful, never generic.
 If user implies timing ("tomorrow", "at 5", "in 2 hours", "remind me"): create reminder_add items.
 If user plans tasks/events: create schedule_add items.
 If user asks for flights/prices/news/weather/events/current info: add 1-3 search_queries.
+If user mentions spending money ("spent", "bought", "paid", "cost me", amounts with currency): create expense_add items.
+When the user sends a voice message (prefixed with [Voice message]:), respond to what they actually said — answer questions, follow instructions, have a conversation. Only summarize if they explicitly ask for a summary.
 
 Current schedule (today):
 {today_sched_text()}
@@ -758,20 +838,39 @@ Current reminders:
 
 Current price watches:
 {watches_text()}
+
+This month's expenses:
+{expenses_summary}
 {sc}
 """
+
+
+def add_to_history(uid: int, role: str, text: str):
+    key = str(uid)
+    if key not in conversation_history:
+        conversation_history[key] = []
+    conversation_history[key].append({"role": role, "content": text})
+    if len(conversation_history[key]) > MAX_HISTORY * 2:
+        conversation_history[key] = conversation_history[key][-MAX_HISTORY * 2:]
+
+
+def get_history(uid: int) -> List[Dict[str, Any]]:
+    return conversation_history.get(str(uid), [])
 
 
 async def shanti_respond(uid: int, user_text: str, pre_search_ctx: str = "") -> Dict[str, Any]:
     tool = tool_schema()
     system = build_system_context(uid, pre_search_ctx)
 
+    history = get_history(uid)
+    messages = list(history) + [{"role": "user", "content": user_text}]
+
     def _call():
         resp = anthropic_client.messages.create(
             model=ANTHROPIC_MODEL,
             max_tokens=1400,
             system=system,
-            messages=[{"role": "user", "content": user_text}],
+            messages=messages,
             tools=[tool],
             tool_choice={"type": "tool", "name": "shanti_output"},
         )
@@ -789,11 +888,16 @@ async def shanti_respond(uid: int, user_text: str, pre_search_ctx: str = "") -> 
                 "reminder_add": [], "reminder_remove": [],
                 "price_watch_add": [], "price_watch_clear": False,
                 "pdf_request": None, "search_queries": [],
+                "expense_add": [],
             }
         return out
 
-    # ✅ FIX #1 uses asyncio.to_thread safely because asyncio is imported now
-    return await asyncio.to_thread(_call)  # type: ignore
+    result = await asyncio.to_thread(_call)  # type: ignore
+
+    add_to_history(uid, "user", user_text)
+    add_to_history(uid, "assistant", result.get("reply", ""))
+
+    return result
 
 
 # ---------------- Apply actions ----------------
@@ -989,13 +1093,18 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 Hey! I'm Shanti — your personal assistant.\n\n"
         "Send me:\n"
-        "• random thoughts (I’ll structure them)\n"
-        "• tasks/plans (I’ll schedule)\n"
-        "• reminders (I’ll remind)\n"
-        "• audio/video notes (I’ll transcribe + summarize)\n\n"
+        "• text messages (I'll respond naturally)\n"
+        "• photos (I'll describe, read text, answer questions)\n"
+        "• voice/audio notes (I'll transcribe and respond)\n"
+        "• documents/PDFs (I'll analyze the content)\n"
+        "• tasks/plans (I'll schedule)\n"
+        "• expenses (I'll track spending)\n\n"
         "Commands:\n"
-        "/today /week /reminders /watches /checkprices /pdf\n"
-        "/clear /clearschedule /clearreminders /clearwatches\n"
+        "/today /week /reminders /watches /expenses\n"
+        "/briefing HH:MM — daily morning summary\n"
+        "/checkprices /pdf\n"
+        "/clear /clearmemory /clearschedule /clearreminders\n"
+        "/clearwatches /clearexpenses\n"
     )
 
 
@@ -1055,6 +1164,7 @@ async def cmd_checkprices(update: Update, context: ContextTypes.DEFAULT_TYPE):
     out = await shanti_respond(uid, f"Here are the latest price watch results:\n\n{combined}")
     apply_schedule_actions(out)
     apply_watch_actions(out)
+    apply_expense_actions(out)
     scheduled = apply_reminder_actions(out, uid)
 
     cid = update.effective_chat.id
@@ -1136,6 +1246,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     apply_schedule_actions(out)
     apply_watch_actions(out)
+    apply_expense_actions(out)
     scheduled = apply_reminder_actions(out, uid)
 
     cid = update.effective_chat.id
@@ -1198,12 +1309,7 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not transcript:
             return await update.message.reply_text("❌ Transcription failed. Try another format or shorter clip.")
 
-        prompt = (
-            f"[TRANSCRIPT START]\n{transcript}\n[TRANSCRIPT END]\n\n"
-            "Please:\n"
-            "1) Summarize\n2) Extract tasks/reminders/schedule items\n3) Structure thoughts into themes\n"
-            "Be concise and actionable."
-        )
+        prompt = f"[Voice message]:\n{transcript}"
 
         search_ctx = ""
         if should_search_heuristic(transcript) and tavily_client:
@@ -1218,6 +1324,7 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         apply_schedule_actions(out)
         apply_watch_actions(out)
+        apply_expense_actions(out)
         scheduled = apply_reminder_actions(out, uid)
         for r in scheduled:
             schedule_reminder_job(context.application, r, cid)
@@ -1243,6 +1350,302 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
             os.unlink(tmp)
         except Exception:
             pass
+
+
+# ---------------- Photo handler ----------------
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not is_allowed(uid):
+        return
+    save_chat_id(uid, update.effective_chat.id)
+
+    photo = update.message.photo[-1]  # highest resolution
+    caption = (update.message.caption or "").strip()
+
+    await update.message.reply_text("🔍 Analyzing image…")
+    await update.message.chat.send_action("typing")
+
+    try:
+        f = await context.bot.get_file(photo.file_id)
+        img_bytes = await f.download_as_bytearray()
+
+        img_b64 = base64.standard_b64encode(bytes(img_bytes)).decode("utf-8")
+
+        user_instruction = caption if caption else "Describe this image in detail. If there's any text visible, read and transcribe all of it."
+
+        content = [
+            {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/jpeg",
+                    "data": img_b64,
+                },
+            },
+            {"type": "text", "text": user_instruction},
+        ]
+
+        system = build_system_context(uid)
+
+        def _call():
+            tool = tool_schema()
+            resp = anthropic_client.messages.create(
+                model=ANTHROPIC_MODEL,
+                max_tokens=1400,
+                system=system,
+                messages=[{"role": "user", "content": content}],
+                tools=[tool],
+                tool_choice={"type": "tool", "name": "shanti_output"},
+            )
+            out = None
+            for block in getattr(resp, "content", []) or []:
+                if getattr(block, "type", None) == "tool_use" and getattr(block, "name", None) == "shanti_output":
+                    out = getattr(block, "input", None)
+                    break
+            if not isinstance(out, dict):
+                return {
+                    "reply": "I can see the image but couldn't process it fully. Could you try again?",
+                    "schedule_add": [], "schedule_remove": [], "schedule_edit": [],
+                    "reminder_add": [], "reminder_remove": [],
+                    "price_watch_add": [], "price_watch_clear": False,
+                    "pdf_request": None, "search_queries": [], "expense_add": [],
+                }
+            return out
+
+        out = await asyncio.to_thread(_call)
+
+        add_to_history(uid, "user", f"[Photo: {user_instruction}]")
+        add_to_history(uid, "assistant", out.get("reply", ""))
+
+        apply_schedule_actions(out)
+        apply_watch_actions(out)
+        apply_expense_actions(out)
+        scheduled = apply_reminder_actions(out, uid)
+
+        cid = update.effective_chat.id
+        for r in scheduled:
+            schedule_reminder_job(context.application, r, cid)
+
+        await update.message.reply_text(out["reply"])
+        await maybe_send_pdf(update, out.get("pdf_request"), uid)
+
+    except Exception as e:
+        logger.error(f"Photo handling error: {e}")
+        await update.message.reply_text(f"Failed to analyze image: {str(e)[:200]}")
+
+
+# ---------------- Document handler ----------------
+DOC_TEXT_EXTS = {".txt", ".csv", ".json", ".xml", ".html", ".md", ".log", ".py", ".js", ".ts", ".css"}
+
+def is_document_message(msg) -> bool:
+    if not msg.document:
+        return False
+    if is_audio_message(msg):
+        return False
+    name = (msg.document.file_name or "").lower()
+    mime = (msg.document.mime_type or "").lower()
+    if name.endswith(".pdf") or mime == "application/pdf":
+        return True
+    if any(name.endswith(e) for e in DOC_TEXT_EXTS):
+        return True
+    if mime.startswith("text/"):
+        return True
+    return False
+
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not is_allowed(uid):
+        return
+    msg = update.message
+    if not is_document_message(msg):
+        return
+    save_chat_id(uid, update.effective_chat.id)
+
+    doc = msg.document
+    fname = doc.file_name or "document"
+    mime = (doc.mime_type or "").lower()
+    caption = (msg.caption or "").strip()
+
+    await msg.reply_text(f"📄 Received: {fname}. Analyzing…")
+    await msg.chat.send_action("typing")
+
+    tmp = os.path.join(str(TEMP_DIR), f"doc_{uid}_{msg.message_id}_{fname}")
+    try:
+        f = await context.bot.get_file(doc.file_id)
+        await f.download_to_drive(tmp)
+
+        text = ""
+        if fname.lower().endswith(".pdf") or mime == "application/pdf":
+            try:
+                import fitz
+                pdf = fitz.open(tmp)
+                pages = []
+                for page in pdf:
+                    pages.append(page.get_text())
+                pdf.close()
+                text = "\n\n---\n\n".join(pages)
+            except ImportError:
+                await msg.reply_text("PDF support not available (PyMuPDF not installed).")
+                return
+            except Exception as e:
+                await msg.reply_text(f"Failed to read PDF: {str(e)[:200]}")
+                return
+        else:
+            try:
+                with open(tmp, "r", encoding="utf-8", errors="replace") as tf:
+                    text = tf.read()
+            except Exception as e:
+                await msg.reply_text(f"Failed to read file: {str(e)[:200]}")
+                return
+
+        if not text.strip():
+            await msg.reply_text("The document appears to be empty.")
+            return
+
+        if len(text) > 15000:
+            text = text[:15000] + "\n\n[… truncated]"
+
+        user_instruction = caption if caption else "Analyze this document and highlight the key points."
+        prompt = f"[Document: {fname}]\n{text}\n\n{user_instruction}"
+
+        out = await shanti_respond(uid, prompt)
+
+        apply_schedule_actions(out)
+        apply_watch_actions(out)
+        apply_expense_actions(out)
+        scheduled = apply_reminder_actions(out, uid)
+
+        cid = update.effective_chat.id
+        for r in scheduled:
+            schedule_reminder_job(context.application, r, cid)
+
+        await msg.reply_text(out["reply"])
+        await maybe_send_pdf(update, out.get("pdf_request"), uid)
+
+    except Exception as e:
+        logger.error(f"Document handling error: {e}")
+        await msg.reply_text(f"Failed to process document: {str(e)[:200]}")
+    finally:
+        try:
+            os.unlink(tmp)
+        except Exception:
+            pass
+
+
+# ---------------- Document/Media dispatcher ----------------
+async def handle_document_or_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    if is_audio_message(msg):
+        await handle_media(update, context)
+    elif is_document_message(msg):
+        await handle_document(update, context)
+
+
+# ---------------- New commands ----------------
+async def cmd_expenses(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not is_allowed(uid):
+        return
+    args = (update.message.text or "").split()
+    month = args[1] if len(args) > 1 else ""
+    await update.message.reply_text(monthly_expenses_text(month))
+
+
+async def cmd_clear_expenses(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not is_allowed(uid):
+        return
+    save_expenses([])
+    await update.message.reply_text("Expenses cleared.")
+
+
+async def cmd_clear_memory(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not is_allowed(uid):
+        return
+    conversation_history.pop(str(uid), None)
+    await update.message.reply_text("Conversation memory cleared.")
+
+
+async def cmd_briefing(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not is_allowed(uid):
+        return
+    save_chat_id(uid, update.effective_chat.id)
+
+    args = (update.message.text or "").split()
+    if len(args) < 2:
+        b = load_briefing()
+        setting = b.get(str(uid))
+        if setting:
+            await update.message.reply_text(f"Morning briefing set for {setting['time']}.\nUse /briefing HH:MM to change or /briefing off to disable.")
+        else:
+            await update.message.reply_text("No briefing set.\nUse /briefing HH:MM (e.g. /briefing 08:00) to enable.")
+        return
+
+    arg = args[1].strip().lower()
+    b = load_briefing()
+
+    if arg == "off":
+        b.pop(str(uid), None)
+        save_briefing(b)
+        for j in context.application.job_queue.jobs():
+            if getattr(j, "name", "") == f"briefing_{uid}":
+                j.schedule_removal()
+        await update.message.reply_text("Morning briefing disabled.")
+        return
+
+    try:
+        hour, minute = map(int, arg.split(":"))
+        assert 0 <= hour <= 23 and 0 <= minute <= 59
+    except Exception:
+        await update.message.reply_text("Invalid time. Use HH:MM format (e.g. 08:00).")
+        return
+
+    b[str(uid)] = {"time": arg, "chat_id": update.effective_chat.id}
+    save_briefing(b)
+
+    for j in context.application.job_queue.jobs():
+        if getattr(j, "name", "") == f"briefing_{uid}":
+            j.schedule_removal()
+
+    schedule_briefing_job(context.application, uid, arg, update.effective_chat.id)
+    await update.message.reply_text(f"Morning briefing set for {arg} daily.")
+
+
+def schedule_briefing_job(app: Application, uid: int, time_str: str, chat_id: int):
+    hour, minute = map(int, time_str.split(":"))
+    from datetime import time as dt_time
+    job_time = dt_time(hour=hour, minute=minute, tzinfo=TZ)
+    app.job_queue.run_daily(
+        fire_briefing,
+        time=job_time,
+        data={"uid": uid, "chat_id": chat_id},
+        name=f"briefing_{uid}",
+    )
+
+
+async def fire_briefing(ctx):
+    data = ctx.job.data
+    uid = data["uid"]
+    chat_id = data["chat_id"]
+    try:
+        lines = []
+        lines.append(f"☀️ Good morning! Here's your briefing for {today_key()}:\n")
+        lines.append(today_sched_text())
+        lines.append("")
+        lines.append(reminders_text())
+
+        expenses = monthly_expenses_text()
+        if not expenses.startswith("No expenses"):
+            lines.append("")
+            lines.append(expenses)
+
+        text = "\n".join(lines)
+        await ctx.bot.send_message(chat_id=chat_id, text=text)
+    except Exception as e:
+        logger.error(f"Briefing send failed: {e}")
 
 
 # ---------------- Lifecycle hooks ----------------
@@ -1288,7 +1691,17 @@ async def post_init(app: Application):
         count += 1
 
     app.job_queue.run_repeating(reminder_safety_check, interval=60, first=10)
-    logger.info(f"Bot ready. Rescheduled {count} reminder(s).")
+
+    briefings = load_briefing()
+    b_count = 0
+    for uid_str, cfg in briefings.items():
+        try:
+            schedule_briefing_job(app, int(uid_str), cfg["time"], cfg["chat_id"])
+            b_count += 1
+        except Exception as e:
+            logger.warning(f"Failed to reschedule briefing for {uid_str}: {e}")
+
+    logger.info(f"Bot ready. Rescheduled {count} reminder(s), {b_count} briefing(s).")
 
     if not ffmpeg_exists():
         logger.warning("ffmpeg/ffprobe not found. Long file chunking may not work.")
@@ -1321,13 +1734,19 @@ def main():
     app.add_handler(CommandHandler("watches", cmd_watches))
     app.add_handler(CommandHandler("checkprices", cmd_checkprices))
     app.add_handler(CommandHandler("pdf", cmd_pdf))
+    app.add_handler(CommandHandler("expenses", cmd_expenses))
+    app.add_handler(CommandHandler("briefing", cmd_briefing))
 
     app.add_handler(CommandHandler("clear", cmd_clear))
+    app.add_handler(CommandHandler("clearmemory", cmd_clear_memory))
     app.add_handler(CommandHandler("clearschedule", cmd_clear_schedule))
     app.add_handler(CommandHandler("clearreminders", cmd_clear_reminders))
     app.add_handler(CommandHandler("clearwatches", cmd_clear_watches))
+    app.add_handler(CommandHandler("clearexpenses", cmd_clear_expenses))
 
-    app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO | filters.VIDEO | filters.VIDEO_NOTE | filters.Document.ALL, handle_media))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO | filters.VIDEO | filters.VIDEO_NOTE, handle_media))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document_or_media))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     logger.info("Starting Shanti…")
