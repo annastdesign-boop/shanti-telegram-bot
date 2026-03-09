@@ -1353,20 +1353,31 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------------- Photo handler ----------------
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if not is_allowed(uid):
-        return
-    save_chat_id(uid, update.effective_chat.id)
+IMAGE_MIMES = {"image/jpeg", "image/png", "image/gif", "image/webp", "image/bmp", "image/tiff"}
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tiff", ".heic"}
 
-    photo = update.message.photo[-1]  # highest resolution
-    caption = (update.message.caption or "").strip()
+
+def is_image_document(msg) -> bool:
+    if not msg.document:
+        return False
+    mime = (msg.document.mime_type or "").lower()
+    name = (msg.document.file_name or "").lower()
+    if mime in IMAGE_MIMES or mime.startswith("image/"):
+        return True
+    if any(name.endswith(e) for e in IMAGE_EXTS):
+        return True
+    return False
+
+
+async def analyze_image(update: Update, context: ContextTypes.DEFAULT_TYPE, file_id: str, caption: str, media_type: str = "image/jpeg"):
+    uid = update.effective_user.id
+    save_chat_id(uid, update.effective_chat.id)
 
     await update.message.reply_text("🔍 Analyzing image…")
     await update.message.chat.send_action("typing")
 
     try:
-        f = await context.bot.get_file(photo.file_id)
+        f = await context.bot.get_file(file_id)
         img_bytes = await f.download_as_bytearray()
 
         img_b64 = base64.standard_b64encode(bytes(img_bytes)).decode("utf-8")
@@ -1378,7 +1389,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "type": "image",
                 "source": {
                     "type": "base64",
-                    "media_type": "image/jpeg",
+                    "media_type": media_type,
                     "data": img_b64,
                 },
             },
@@ -1391,7 +1402,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             tool = tool_schema()
             resp = anthropic_client.messages.create(
                 model=ANTHROPIC_MODEL,
-                max_tokens=1400,
+                max_tokens=2000,
                 system=system,
                 messages=[{"role": "user", "content": content}],
                 tools=[tool],
@@ -1417,6 +1428,13 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         add_to_history(uid, "user", f"[Photo: {user_instruction}]")
         add_to_history(uid, "assistant", out.get("reply", ""))
 
+        last_transcriptions[str(uid)] = {
+            "transcript": out.get("reply", ""),
+            "summary": out.get("reply", ""),
+            "title": "Image Analysis",
+            "timestamp": tnow().isoformat(),
+        }
+
         apply_schedule_actions(out)
         apply_watch_actions(out)
         apply_expense_actions(out)
@@ -1430,8 +1448,17 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await maybe_send_pdf(update, out.get("pdf_request"), uid)
 
     except Exception as e:
-        logger.error(f"Photo handling error: {e}")
-        await update.message.reply_text(f"Failed to analyze image: {str(e)[:200]}")
+        logger.error(f"Photo handling error: {type(e).__name__}: {e}")
+        await update.message.reply_text(f"Failed to analyze image: {type(e).__name__}: {str(e)[:200]}")
+
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not is_allowed(uid):
+        return
+    photo = update.message.photo[-1]
+    caption = (update.message.caption or "").strip()
+    await analyze_image(update, context, photo.file_id, caption, "image/jpeg")
 
 
 # ---------------- Document handler ----------------
@@ -1538,6 +1565,14 @@ async def handle_document_or_media(update: Update, context: ContextTypes.DEFAULT
     msg = update.message
     if is_audio_message(msg):
         await handle_media(update, context)
+    elif is_image_document(msg):
+        uid = msg.from_user.id if msg.from_user else 0
+        if not is_allowed(uid):
+            return
+        doc = msg.document
+        mime = (doc.mime_type or "image/jpeg").lower()
+        caption = (msg.caption or "").strip()
+        await analyze_image(update, context, doc.file_id, caption, mime)
     elif is_document_message(msg):
         await handle_document(update, context)
 
