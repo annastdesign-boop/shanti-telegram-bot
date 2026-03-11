@@ -17,6 +17,8 @@ import math
 import base64
 import asyncio  # ✅ FIX #1: needed for asyncio.to_thread(...)
 import logging
+import time
+import traceback
 import subprocess
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -66,7 +68,7 @@ ALLOWED_USER_ID = os.environ.get("ALLOWED_USER_ID")
 USER_TIMEZONE = os.environ.get("USER_TIMEZONE", "Europe/Berlin")
 TZ = ZoneInfo(USER_TIMEZONE)
 
-ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-5").strip() or "claude-sonnet-4-5"
+ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-5-20250929").strip() or "claude-sonnet-4-5-20250929"
 
 WHISPER_MAX_BYTES = 24 * 1024 * 1024
 BOT_API_LIMIT = 20 * 1024 * 1024
@@ -866,31 +868,42 @@ async def shanti_respond(uid: int, user_text: str, pre_search_ctx: str = "") -> 
     messages = list(history) + [{"role": "user", "content": user_text}]
 
     def _call():
-        resp = anthropic_client.messages.create(
-            model=ANTHROPIC_MODEL,
-            max_tokens=1400,
-            system=system,
-            messages=messages,
-            tools=[tool],
-            tool_choice={"type": "tool", "name": "shanti_output"},
-        )
+        last_err = None
+        for attempt in range(3):
+            try:
+                resp = anthropic_client.messages.create(
+                    model=ANTHROPIC_MODEL,
+                    max_tokens=1400,
+                    system=system,
+                    messages=messages,
+                    tools=[tool],
+                    tool_choice={"type": "tool", "name": "shanti_output"},
+                )
 
-        out = None
-        for block in getattr(resp, "content", []) or []:
-            if getattr(block, "type", None) == "tool_use" and getattr(block, "name", None) == "shanti_output":
-                out = getattr(block, "input", None)
-                break
+                out = None
+                for block in getattr(resp, "content", []) or []:
+                    if getattr(block, "type", None) == "tool_use" and getattr(block, "name", None) == "shanti_output":
+                        out = getattr(block, "input", None)
+                        break
 
-        if not isinstance(out, dict):
-            return {
-                "reply": "I got you — do you want me to log this, set reminders, or build a plan?",
-                "schedule_add": [], "schedule_remove": [], "schedule_edit": [],
-                "reminder_add": [], "reminder_remove": [],
-                "price_watch_add": [], "price_watch_clear": False,
-                "pdf_request": None, "search_queries": [],
-                "expense_add": [],
-            }
-        return out
+                if not isinstance(out, dict):
+                    return {
+                        "reply": "I got you — do you want me to log this, set reminders, or build a plan?",
+                        "schedule_add": [], "schedule_remove": [], "schedule_edit": [],
+                        "reminder_add": [], "reminder_remove": [],
+                        "price_watch_add": [], "price_watch_clear": False,
+                        "pdf_request": None, "search_queries": [],
+                        "expense_add": [],
+                    }
+                return out
+            except Exception as e:
+                last_err = e
+                logger.warning(f"Anthropic API attempt {attempt+1}/3 failed: {type(e).__name__}: {e}")
+                if attempt < 2:
+                    time.sleep(2 ** attempt)  # 1s, 2s backoff
+                continue
+        # All retries exhausted — raise so the error handler can inform the user
+        raise last_err  # type: ignore
 
     result = await asyncio.to_thread(_call)  # type: ignore
 
@@ -1048,7 +1061,14 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.exception("Unhandled exception", exc_info=context.error)
     try:
         if isinstance(update, Update) and update.effective_message:
-            await update.effective_message.reply_text("⚠️ I crashed on that message, but I’m back now. Try again.")
+            err = context.error
+            err_type = type(err).__name__ if err else "Unknown"
+            err_msg = str(err)[:300] if err else "No details"
+            # Show the actual error so the user can diagnose
+            await update.effective_message.reply_text(
+                f"⚠️ Error: {err_type}\n{err_msg}\n\n"
+                f"If this keeps happening, check your API keys and Railway logs."
+            )
     except Exception:
         pass
 
@@ -1400,28 +1420,38 @@ async def analyze_image(update: Update, context: ContextTypes.DEFAULT_TYPE, file
 
         def _call():
             tool = tool_schema()
-            resp = anthropic_client.messages.create(
-                model=ANTHROPIC_MODEL,
-                max_tokens=2000,
-                system=system,
-                messages=[{"role": "user", "content": content}],
-                tools=[tool],
-                tool_choice={"type": "tool", "name": "shanti_output"},
-            )
-            out = None
-            for block in getattr(resp, "content", []) or []:
-                if getattr(block, "type", None) == "tool_use" and getattr(block, "name", None) == "shanti_output":
-                    out = getattr(block, "input", None)
-                    break
-            if not isinstance(out, dict):
-                return {
-                    "reply": "I can see the image but couldn't process it fully. Could you try again?",
-                    "schedule_add": [], "schedule_remove": [], "schedule_edit": [],
-                    "reminder_add": [], "reminder_remove": [],
-                    "price_watch_add": [], "price_watch_clear": False,
-                    "pdf_request": None, "search_queries": [], "expense_add": [],
-                }
-            return out
+            last_err = None
+            for attempt in range(3):
+                try:
+                    resp = anthropic_client.messages.create(
+                        model=ANTHROPIC_MODEL,
+                        max_tokens=2000,
+                        system=system,
+                        messages=[{"role": "user", "content": content}],
+                        tools=[tool],
+                        tool_choice={"type": "tool", "name": "shanti_output"},
+                    )
+                    out = None
+                    for block in getattr(resp, "content", []) or []:
+                        if getattr(block, "type", None) == "tool_use" and getattr(block, "name", None) == "shanti_output":
+                            out = getattr(block, "input", None)
+                            break
+                    if not isinstance(out, dict):
+                        return {
+                            "reply": "I can see the image but couldn't process it fully. Could you try again?",
+                            "schedule_add": [], "schedule_remove": [], "schedule_edit": [],
+                            "reminder_add": [], "reminder_remove": [],
+                            "price_watch_add": [], "price_watch_clear": False,
+                            "pdf_request": None, "search_queries": [], "expense_add": [],
+                        }
+                    return out
+                except Exception as e:
+                    last_err = e
+                    logger.warning(f"Image analysis API attempt {attempt+1}/3 failed: {type(e).__name__}: {e}")
+                    if attempt < 2:
+                        time.sleep(2 ** attempt)
+                    continue
+            raise last_err  # type: ignore
 
         out = await asyncio.to_thread(_call)
 
